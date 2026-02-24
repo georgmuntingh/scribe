@@ -6,7 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "vite",
-    "build": "node scripts/generate-build-info.js && vite build",
+    "build": "vite build",
     "preview": "vite preview"
   },
   "repository": {
