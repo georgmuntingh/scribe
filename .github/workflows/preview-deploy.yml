@@ -1,0 +1,55 @@
+name: Deploy PR Preview
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - closed
+
+# concurrency: preview-${{ github.ref }}
+concurrency:
+  group: 'gh-pages-shared'
+  cancel-in-progress: false
+
+jobs:
+  deploy-preview:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: github.event.action != 'closed'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          # cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        if: github.event.action != 'closed'
+        run: npm ci
+
+      - name: Build
+        if: github.event.action != 'closed'
+        run: npm run build
+        env:
+          # Set base path for PR previews - must match umbrella-dir structure
+          VITE_BASE_PATH: /scribe/pr-previews/pr-${{ github.event.number }}/
+
+      - name: Add .nojekyll file
+        if: github.event.action != 'closed'
+        run: touch dist/.nojekyll
+
+      - name: Deploy PR Preview
+        uses: rossjrw/pr-preview-action@v1
+        with:
+          source-dir: dist/
+          preview-branch: gh-pages
+          umbrella-dir: pr-previews
+          action: ${{ github.event.action == 'closed' && 'remove' || 'deploy' }}
