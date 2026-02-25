@@ -98,7 +98,9 @@ export class MicRecorder {
           const audio = await decodeAudioBlob(e.data);
           if (this.onChunk) this.onChunk(audio);
         } catch (err) {
-          if (this.onError) this.onError(err);
+          // Only report errors while actively recording; the final chunk
+          // emitted by stop() may be too small to decode.
+          if (this.recording && this.onError) this.onError(err);
         }
       } else {
         // In manual mode, accumulate chunks

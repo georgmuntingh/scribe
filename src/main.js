@@ -126,9 +126,13 @@ function loadModel() {
 
 function requestTranscription(audio) {
   pendingChunks++;
-  appState = "transcribing";
-  setStatus("Transcribing...");
-  updateControls();
+  // Don't change state while recording — real-time chunks are transcribed
+  // in the background and the UI should keep showing "Stop".
+  if (appState !== "recording") {
+    appState = "transcribing";
+    setStatus("Transcribing...");
+    updateControls();
+  }
   worker.postMessage({
     type: "transcribe",
     audio,
