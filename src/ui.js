@@ -120,6 +120,7 @@ export const DEFAULT_SETTINGS = {
   temperature: 0,
   initialPrompt: "",
   chunkInterval: 10,
+  overlapDuration: 3,
   recordingMode: "realtime",
 };
 
@@ -307,6 +308,23 @@ export function buildSettingsModal(container, settings, onSave) {
     ),
   );
 
+  recSection.appendChild(
+    rangeField(
+      "Overlap duration (seconds)",
+      "s-overlapDuration",
+      settings.overlapDuration,
+      1,
+      10,
+      1,
+    ),
+  );
+
+  const overlapHint = document.createElement("div");
+  overlapHint.className = "field__hint";
+  overlapHint.textContent =
+    "Overlap between consecutive audio windows. Higher values improve accuracy at chunk boundaries but increase processing.";
+  recSection.appendChild(overlapHint);
+
   modal.appendChild(recSection);
 
   // ── Footer ─────────────────────────
@@ -353,6 +371,7 @@ export function buildSettingsModal(container, settings, onSave) {
       temperature: floatVal("s-temperature"),
       initialPrompt: val("s-initialPrompt"),
       chunkInterval: intVal("s-chunkInterval"),
+      overlapDuration: intVal("s-overlapDuration"),
       recordingMode: settings.recordingMode, // preserved from app state
     };
     saveSettings(updated);
