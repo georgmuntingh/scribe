@@ -87,14 +87,20 @@ worker.addEventListener("message", (e) => {
 
     case "result":
       pendingChunks = Math.max(0, pendingChunks - 1);
-      if (msg.text && msg.text.trim()) {
-        if (msg.usesMerger) {
-          // Real-time overlapping mode: merge into accumulated transcript
-          const merged = merger.add(msg.text.trim());
-          transcriptText = merged;
-          updateTranscriptDisplay();
-        } else {
-          appendTranscript(msg.text.trim());
+      {
+        // Strip Whisper artifacts like [BLANK_AUDIO] before processing
+        const cleaned = (msg.text || "")
+          .replace(/\[BLANK_AUDIO\]/gi, "")
+          .trim();
+        if (cleaned) {
+          if (msg.usesMerger) {
+            // Real-time overlapping mode: merge into accumulated transcript
+            const merged = merger.add(cleaned);
+            transcriptText = merged;
+            updateTranscriptDisplay();
+          } else {
+            appendTranscript(cleaned);
+          }
         }
       }
       // If no more pending chunks and not recording, go back to ready

@@ -73,7 +73,8 @@ export class MicRecorder {
     this._sourceNode = null;
     this._processorNode = null;
     this._pcmBuffer = []; // accumulated Float32 chunks from processor
-    this._pcmSampleCount = 0; // total samples accumulated
+    this._pcmSampleCount = 0; // total samples accumulated (absolute)
+    this._bufferBaseOffset = 0; // absolute sample position of _pcmBuffer[0]
     this._windowStart = 0; // sample offset for the next window's start
 
     // Callbacks
@@ -143,6 +144,7 @@ export class MicRecorder {
   _startContinuousCapture() {
     this._pcmBuffer = [];
     this._pcmSampleCount = 0;
+    this._bufferBaseOffset = 0;
     this._windowStart = 0;
 
     this._audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
@@ -201,11 +203,14 @@ export class MicRecorder {
 
   /**
    * Flatten the accumulated PCM chunks and extract a range of samples.
+   * startSample is an absolute sample position; we adjust for trimmed chunks
+   * using _bufferBaseOffset.
    */
   _extractSamples(startSample, count) {
     const result = new Float32Array(count);
     let written = 0;
-    let offset = 0; // running offset into the logical buffer
+    // offset tracks the absolute position of the current chunk's start
+    let offset = this._bufferBaseOffset;
 
     for (const chunk of this._pcmBuffer) {
       const chunkEnd = offset + chunk.length;
@@ -230,7 +235,7 @@ export class MicRecorder {
    * Remove PCM chunks that are entirely before _windowStart to free memory.
    */
   _trimBuffer() {
-    let offset = 0;
+    let offset = this._bufferBaseOffset;
     let trimCount = 0;
     for (const chunk of this._pcmBuffer) {
       if (offset + chunk.length <= this._windowStart) {
@@ -242,7 +247,7 @@ export class MicRecorder {
     }
     if (trimCount > 0) {
       this._pcmBuffer.splice(0, trimCount);
-      // _windowStart and _pcmSampleCount are absolute, no adjustment needed
+      this._bufferBaseOffset = offset;
     }
   }
 
@@ -303,6 +308,7 @@ export class MicRecorder {
     }
     this._pcmBuffer = [];
     this._pcmSampleCount = 0;
+    this._bufferBaseOffset = 0;
     this._windowStart = 0;
   }
 
