@@ -60,6 +60,7 @@ export class MicRecorder {
     this.recording = false;
     this.mode = "realtime"; // "realtime" or "manual"
     this.chunkInterval = 10; // seconds
+    this._chunkTimer = null;
 
     // Callbacks
     this.onChunk = null;
@@ -81,68 +82,124 @@ export class MicRecorder {
       return;
     }
 
-    // Use a timeslice for real-time mode so ondataavailable fires periodically
-    const timeslice =
-      this.mode === "realtime" ? this.chunkInterval * 1000 : undefined;
+    if (this.mode === "realtime") {
+      // In real-time mode, we stop and restart the MediaRecorder at each
+      // interval so that every segment is a complete, independently
+      // decodable recording (the timeslice approach produces headerless
+      // fragments after the first chunk that cannot be decoded).
+      this._startRealtimeSegment();
+      this._chunkTimer = setInterval(() => {
+        if (!this.recording) return;
+        this._rotateRealtimeSegment();
+      }, this.chunkInterval * 1000);
+    } else {
+      this.mediaRecorder = new MediaRecorder(this.stream, {
+        mimeType: this._pickMimeType(),
+      });
 
-    this.mediaRecorder = new MediaRecorder(this.stream, {
+      this.mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) this.chunks.push(e.data);
+      };
+
+      this.mediaRecorder.onstop = async () => {
+        if (this.chunks.length > 0) {
+          try {
+            const fullBlob = new Blob(this.chunks, {
+              type: this.chunks[0].type,
+            });
+            const audio = await decodeAudioBlob(fullBlob);
+            if (this.onComplete) this.onComplete(audio);
+          } catch (err) {
+            if (this.onError) this.onError(err);
+          }
+        }
+        this._cleanup();
+      };
+
+      this.mediaRecorder.onerror = (e) => {
+        if (this.onError)
+          this.onError(e.error || new Error("Recording error"));
+        this._cleanup();
+      };
+
+      this.mediaRecorder.start();
+    }
+  }
+
+  /**
+   * Start a new real-time segment. Each segment is an independent
+   * MediaRecorder session that produces a complete, decodable blob.
+   */
+  _startRealtimeSegment() {
+    // Use a local array so the onstop closure captures this segment's
+    // chunks even after _rotateRealtimeSegment overwrites mediaRecorder.
+    const segmentChunks = [];
+
+    const mr = new MediaRecorder(this.stream, {
       mimeType: this._pickMimeType(),
     });
 
-    this.mediaRecorder.ondataavailable = async (e) => {
-      if (e.data.size === 0) return;
+    mr.ondataavailable = (e) => {
+      if (e.data.size > 0) segmentChunks.push(e.data);
+    };
 
-      if (this.mode === "realtime") {
-        // In real-time mode, decode and emit each chunk immediately
-        try {
-          const audio = await decodeAudioBlob(e.data);
-          if (this.onChunk) this.onChunk(audio);
-        } catch (err) {
-          if (this.onError) this.onError(err);
-        }
-      } else {
-        // In manual mode, accumulate chunks
-        this.chunks.push(e.data);
+    mr.onstop = async () => {
+      if (segmentChunks.length === 0) return;
+      try {
+        const blob = new Blob(segmentChunks, { type: segmentChunks[0].type });
+        const audio = await decodeAudioBlob(blob);
+        if (this.onChunk) this.onChunk(audio);
+      } catch (err) {
+        // Only report errors while actively recording; the final segment
+        // when the user presses Stop may be too small to decode.
+        if (this.recording && this.onError) this.onError(err);
       }
     };
 
-    this.mediaRecorder.onstop = async () => {
-      if (this.mode === "manual" && this.chunks.length > 0) {
-        try {
-          const fullBlob = new Blob(this.chunks, {
-            type: this.chunks[0].type,
-          });
-          const audio = await decodeAudioBlob(fullBlob);
-          if (this.onComplete) this.onComplete(audio);
-        } catch (err) {
-          if (this.onError) this.onError(err);
-        }
-      }
-      this._cleanup();
-    };
-
-    this.mediaRecorder.onerror = (e) => {
+    mr.onerror = (e) => {
       if (this.onError) this.onError(e.error || new Error("Recording error"));
-      this._cleanup();
     };
 
-    this.mediaRecorder.start(timeslice);
+    this.mediaRecorder = mr;
+    mr.start();
+  }
+
+  /**
+   * Stop the current real-time segment and immediately start a new one.
+   * The stopped segment's onstop handler will decode and emit its audio.
+   */
+  _rotateRealtimeSegment() {
+    if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
+      this.mediaRecorder.stop();
+    }
+    this._startRealtimeSegment();
   }
 
   stop() {
     this.recording = false;
+    if (this._chunkTimer) {
+      clearInterval(this._chunkTimer);
+      this._chunkTimer = null;
+    }
     if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
       this.mediaRecorder.stop();
+    }
+    if (this.mode === "realtime") {
+      this._cleanupStream();
     }
   }
 
   _cleanup() {
+    this._cleanupStream();
+    this.mediaRecorder = null;
+    this.recording = false;
+  }
+
+  _cleanupStream() {
     if (this.stream) {
       this.stream.getTracks().forEach((t) => t.stop());
       this.stream = null;
     }
-    this.mediaRecorder = null;
-    this.recording = false;
   }
 
   _pickMimeType() {
