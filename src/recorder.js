@@ -2,6 +2,11 @@
  * Audio recorder module.
  * Handles microphone capture (chunked + manual modes) and file decoding.
  * All output is 16 kHz mono Float32Array — what Whisper expects.
+ *
+ * In real-time mode, audio is captured continuously via a ScriptProcessorNode
+ * (no gaps) and overlapping windows are extracted from the accumulated buffer.
+ * This eliminates the gap problem of stop-restart MediaRecorder cycling and
+ * ensures words at chunk boundaries are transcribed correctly.
  */
 
 const TARGET_SAMPLE_RATE = 16000;
@@ -60,7 +65,17 @@ export class MicRecorder {
     this.recording = false;
     this.mode = "realtime"; // "realtime" or "manual"
     this.chunkInterval = 10; // seconds
+    this.overlapDuration = 3; // seconds of overlap between consecutive windows
     this._chunkTimer = null;
+
+    // Continuous capture state (real-time mode)
+    this._audioContext = null;
+    this._sourceNode = null;
+    this._processorNode = null;
+    this._pcmBuffer = []; // accumulated Float32 chunks from processor
+    this._pcmSampleCount = 0; // total samples accumulated (absolute)
+    this._bufferBaseOffset = 0; // absolute sample position of _pcmBuffer[0]
+    this._windowStart = 0; // sample offset for the next window's start
 
     // Callbacks
     this.onChunk = null;
@@ -68,9 +83,11 @@ export class MicRecorder {
     this.onError = null;
   }
 
-  async start(mode, chunkIntervalSeconds) {
+  async start(mode, chunkIntervalSeconds, overlapSeconds) {
     this.mode = mode;
     this.chunkInterval = chunkIntervalSeconds || 10;
+    this.overlapDuration =
+      typeof overlapSeconds === "number" ? overlapSeconds : 3;
     this.chunks = [];
     this.recording = true;
 
@@ -83,15 +100,7 @@ export class MicRecorder {
     }
 
     if (this.mode === "realtime") {
-      // In real-time mode, we stop and restart the MediaRecorder at each
-      // interval so that every segment is a complete, independently
-      // decodable recording (the timeslice approach produces headerless
-      // fragments after the first chunk that cannot be decoded).
-      this._startRealtimeSegment();
-      this._chunkTimer = setInterval(() => {
-        if (!this.recording) return;
-        this._rotateRealtimeSegment();
-      }, this.chunkInterval * 1000);
+      this._startContinuousCapture();
     } else {
       this.mediaRecorder = new MediaRecorder(this.stream, {
         mimeType: this._pickMimeType(),
@@ -127,52 +136,119 @@ export class MicRecorder {
   }
 
   /**
-   * Start a new real-time segment. Each segment is an independent
-   * MediaRecorder session that produces a complete, decodable blob.
+   * Start continuous PCM capture at 16 kHz using an AudioContext.
+   * Audio flows through: mic → MediaStreamSource → ScriptProcessor → accumulate.
+   * A timer fires every (chunkInterval - overlapDuration) seconds to extract
+   * overlapping windows from the buffer.
    */
-  _startRealtimeSegment() {
-    // Use a local array so the onstop closure captures this segment's
-    // chunks even after _rotateRealtimeSegment overwrites mediaRecorder.
-    const segmentChunks = [];
+  _startContinuousCapture() {
+    this._pcmBuffer = [];
+    this._pcmSampleCount = 0;
+    this._bufferBaseOffset = 0;
+    this._windowStart = 0;
 
-    const mr = new MediaRecorder(this.stream, {
-      mimeType: this._pickMimeType(),
-    });
+    this._audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+    this._sourceNode = this._audioContext.createMediaStreamSource(this.stream);
 
-    mr.ondataavailable = (e) => {
-      if (e.data.size > 0) segmentChunks.push(e.data);
+    // Buffer size 4096 at 16 kHz ≈ 256ms per callback — good balance.
+    this._processorNode = this._audioContext.createScriptProcessor(4096, 1, 1);
+    this._processorNode.onaudioprocess = (e) => {
+      if (!this.recording) return;
+      const input = e.inputBuffer.getChannelData(0);
+      // Copy the samples (the buffer is reused by the browser)
+      const copy = new Float32Array(input.length);
+      copy.set(input);
+      this._pcmBuffer.push(copy);
+      this._pcmSampleCount += copy.length;
     };
 
-    mr.onstop = async () => {
-      if (segmentChunks.length === 0) return;
-      try {
-        const blob = new Blob(segmentChunks, { type: segmentChunks[0].type });
-        const audio = await decodeAudioBlob(blob);
-        if (this.onChunk) this.onChunk(audio);
-      } catch (err) {
-        // Only report errors while actively recording; the final segment
-        // when the user presses Stop may be too small to decode.
-        if (this.recording && this.onError) this.onError(err);
-      }
-    };
+    this._sourceNode.connect(this._processorNode);
+    // ScriptProcessorNode requires connection to destination to fire events
+    this._processorNode.connect(this._audioContext.destination);
 
-    mr.onerror = (e) => {
-      if (this.onError) this.onError(e.error || new Error("Recording error"));
-    };
-
-    this.mediaRecorder = mr;
-    mr.start();
+    // The step between windows: chunkInterval minus overlapDuration.
+    // For example with 10s chunks and 3s overlap, we step 7s forward each time.
+    const stepSeconds = Math.max(1, this.chunkInterval - this.overlapDuration);
+    this._chunkTimer = setInterval(() => {
+      if (!this.recording) return;
+      this._emitWindow();
+    }, stepSeconds * 1000);
   }
 
   /**
-   * Stop the current real-time segment and immediately start a new one.
-   * The stopped segment's onstop handler will decode and emit its audio.
+   * Extract the current window from the accumulated PCM buffer and emit it.
+   * The window spans from _windowStart to _windowStart + chunkInterval*sampleRate,
+   * then _windowStart advances by (chunkInterval - overlapDuration)*sampleRate.
    */
-  _rotateRealtimeSegment() {
-    if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
-      this.mediaRecorder.stop();
+  _emitWindow() {
+    const windowSamples = Math.round(this.chunkInterval * TARGET_SAMPLE_RATE);
+    const stepSamples = Math.round(
+      Math.max(1, this.chunkInterval - this.overlapDuration) *
+        TARGET_SAMPLE_RATE,
+    );
+
+    // Not enough audio accumulated yet for a full window
+    if (this._pcmSampleCount - this._windowStart < windowSamples) return;
+
+    const audio = this._extractSamples(this._windowStart, windowSamples);
+    this._windowStart += stepSamples;
+
+    // Trim old samples we no longer need (before the current window start)
+    this._trimBuffer();
+
+    if (this.onChunk && audio.length > 0) {
+      this.onChunk(audio);
     }
-    this._startRealtimeSegment();
+  }
+
+  /**
+   * Flatten the accumulated PCM chunks and extract a range of samples.
+   * startSample is an absolute sample position; we adjust for trimmed chunks
+   * using _bufferBaseOffset.
+   */
+  _extractSamples(startSample, count) {
+    const result = new Float32Array(count);
+    let written = 0;
+    // offset tracks the absolute position of the current chunk's start
+    let offset = this._bufferBaseOffset;
+
+    for (const chunk of this._pcmBuffer) {
+      const chunkEnd = offset + chunk.length;
+      if (chunkEnd <= startSample) {
+        offset = chunkEnd;
+        continue;
+      }
+      if (offset >= startSample + count) break;
+
+      const readStart = Math.max(0, startSample - offset);
+      const readEnd = Math.min(chunk.length, startSample + count - offset);
+      const segment = chunk.subarray(readStart, readEnd);
+      result.set(segment, written);
+      written += segment.length;
+      offset = chunkEnd;
+    }
+
+    return result;
+  }
+
+  /**
+   * Remove PCM chunks that are entirely before _windowStart to free memory.
+   */
+  _trimBuffer() {
+    let offset = this._bufferBaseOffset;
+    let trimCount = 0;
+    for (const chunk of this._pcmBuffer) {
+      if (offset + chunk.length <= this._windowStart) {
+        offset += chunk.length;
+        trimCount++;
+      } else {
+        break;
+      }
+    }
+    if (trimCount > 0) {
+      this._pcmBuffer.splice(0, trimCount);
+      this._bufferBaseOffset = offset;
+    }
   }
 
   stop() {
@@ -181,12 +257,59 @@ export class MicRecorder {
       clearInterval(this._chunkTimer);
       this._chunkTimer = null;
     }
-    if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
-      this.mediaRecorder.stop();
-    }
+
     if (this.mode === "realtime") {
+      // Emit any remaining audio as a final chunk
+      this._emitFinalWindow();
+      this._stopContinuousCapture();
       this._cleanupStream();
+    } else {
+      if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
+        this.mediaRecorder.stop();
+      }
     }
+  }
+
+  /**
+   * Emit whatever audio remains in the buffer after the last emitted window.
+   */
+  _emitFinalWindow() {
+    const remaining = this._pcmSampleCount - this._windowStart;
+    if (remaining <= 0) return;
+
+    // Use overlap: start from max(0, windowStart - overlapSamples)
+    // so the final window overlaps with the previous one
+    const overlapSamples = Math.round(
+      this.overlapDuration * TARGET_SAMPLE_RATE,
+    );
+    const start = Math.max(0, this._windowStart - overlapSamples);
+    const count = this._pcmSampleCount - start;
+
+    if (count <= 0) return;
+
+    const audio = this._extractSamples(start, count);
+    if (this.onChunk && audio.length > 0) {
+      this.onChunk(audio);
+    }
+  }
+
+  _stopContinuousCapture() {
+    if (this._processorNode) {
+      this._processorNode.disconnect();
+      this._processorNode = null;
+    }
+    if (this._sourceNode) {
+      this._sourceNode.disconnect();
+      this._sourceNode = null;
+    }
+    if (this._audioContext) {
+      this._audioContext.close().catch(() => {});
+      this._audioContext = null;
+    }
+    this._pcmBuffer = [];
+    this._pcmSampleCount = 0;
+    this._bufferBaseOffset = 0;
+    this._windowStart = 0;
   }
 
   _cleanup() {

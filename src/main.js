@@ -1,5 +1,6 @@
 import "./style.css";
 import { MicRecorder, decodeAudioFile } from "./recorder.js";
+import { TranscriptMerger } from "./merger.js";
 import {
   loadSettings,
   saveSettings,
@@ -24,6 +25,7 @@ const worker = new Worker(new URL("./worker.js", import.meta.url), {
 
 let transcriptText = "";
 let pendingChunks = 0;
+const merger = new TranscriptMerger();
 
 // ── DOM references ────────────────────────────────────
 
@@ -85,8 +87,21 @@ worker.addEventListener("message", (e) => {
 
     case "result":
       pendingChunks = Math.max(0, pendingChunks - 1);
-      if (msg.text && msg.text.trim()) {
-        appendTranscript(msg.text.trim());
+      {
+        // Strip Whisper artifacts like [BLANK_AUDIO] before processing
+        const cleaned = (msg.text || "")
+          .replace(/\[BLANK_AUDIO\]/gi, "")
+          .trim();
+        if (cleaned) {
+          if (msg.usesMerger) {
+            // Real-time overlapping mode: merge into accumulated transcript
+            const merged = merger.add(cleaned);
+            transcriptText = merged;
+            updateTranscriptDisplay();
+          } else {
+            appendTranscript(cleaned);
+          }
+        }
       }
       // If no more pending chunks and not recording, go back to ready
       if (pendingChunks <= 0 && appState === "transcribing") {
@@ -124,7 +139,7 @@ function loadModel() {
   });
 }
 
-function requestTranscription(audio) {
+function requestTranscription(audio, { usesMerger = false } = {}) {
   pendingChunks++;
   // Don't change state while recording — real-time chunks are transcribed
   // in the background and the UI should keep showing "Stop".
@@ -136,6 +151,7 @@ function requestTranscription(audio) {
   worker.postMessage({
     type: "transcribe",
     audio,
+    usesMerger,
     options: {
       language: settings.language,
       task: settings.task,
@@ -149,7 +165,7 @@ function requestTranscription(audio) {
 // ── Recorder callbacks ────────────────────────────────
 
 recorder.onChunk = (audio) => {
-  requestTranscription(audio);
+  requestTranscription(audio, { usesMerger: true });
 };
 
 recorder.onComplete = (audio) => {
@@ -167,6 +183,7 @@ recorder.onError = (err) => {
 function startRecording() {
   if (appState !== "ready") return;
   transcriptText = "";
+  merger.reset();
   updateTranscriptDisplay();
   appState = "recording";
   updateControls();
@@ -175,7 +192,11 @@ function startRecording() {
       ? "Recording (real-time)... Speak now."
       : "Recording... Click Stop when done.",
   );
-  recorder.start(settings.recordingMode, settings.chunkInterval);
+  recorder.start(
+    settings.recordingMode,
+    settings.chunkInterval,
+    settings.overlapDuration,
+  );
 }
 
 function stopRecording() {
@@ -360,6 +381,7 @@ downloadBtn.addEventListener("click", () => {
 // Clear
 clearBtn.addEventListener("click", () => {
   transcriptText = "";
+  merger.reset();
   updateTranscriptDisplay();
   updateControls();
 });
