@@ -1,4 +1,4 @@
-import { pipeline, env } from "@huggingface/transformers";
+import { pipeline, env, AutoProcessor, AutoModel } from "@huggingface/transformers";
 
 // Disable local model check — always fetch from HF Hub
 env.allowLocalModels = false;
@@ -6,8 +6,10 @@ env.allowLocalModels = false;
 let transcriber = null;
 let currentModelKey = null;
 
-// Speaker embedding model state
-let speakerExtractor = null;
+// Speaker embedding model state (using AutoModel + AutoProcessor directly,
+// since audio models don't have a tokenizer and the pipeline API requires one)
+let speakerProcessor = null;
+let speakerModel = null;
 let currentSpeakerModelKey = null;
 
 /**
@@ -152,24 +154,49 @@ async function transcribe({ audio, options, usesMerger, windowOffset }) {
 }
 
 /**
+ * Shared progress callback for speaker model downloads.
+ */
+function speakerProgressCallback(progress) {
+  if (progress.status === "progress") {
+    self.postMessage({
+      type: "loading",
+      file: progress.file,
+      progress: progress.progress,
+      loaded: progress.loaded,
+      total: progress.total,
+      status: `Downloading ${progress.file}...`,
+    });
+  } else if (progress.status === "done") {
+    self.postMessage({
+      type: "loading",
+      progress: 100,
+      status: `Loaded ${progress.file}`,
+    });
+  }
+}
+
+/**
  * Load (or re-load) the speaker embedding model.
+ * Uses AutoProcessor + AutoModel directly (audio models lack a tokenizer,
+ * so the pipeline("feature-extraction") API cannot be used).
  */
 async function loadSpeakerModel({ model, device, quantization }) {
   const key = `${model}|${device}|${quantization}`;
 
-  if (key === currentSpeakerModelKey && speakerExtractor) {
+  if (key === currentSpeakerModelKey && speakerModel) {
     self.postMessage({ type: "speaker-model-ready" });
     return;
   }
 
   // Dispose previous speaker model
-  if (speakerExtractor) {
+  if (speakerModel) {
     try {
-      await speakerExtractor.dispose();
+      await speakerModel.dispose();
     } catch {
       // ignore dispose errors
     }
-    speakerExtractor = null;
+    speakerModel = null;
+    speakerProcessor = null;
     currentSpeakerModelKey = null;
   }
 
@@ -179,27 +206,14 @@ async function loadSpeakerModel({ model, device, quantization }) {
     status: `Loading speaker model ${model}...`,
   });
 
-  speakerExtractor = await pipeline("feature-extraction", model, {
+  speakerProcessor = await AutoProcessor.from_pretrained(model, {
+    progress_callback: speakerProgressCallback,
+  });
+
+  speakerModel = await AutoModel.from_pretrained(model, {
     device,
     dtype: quantization,
-    progress_callback: (progress) => {
-      if (progress.status === "progress") {
-        self.postMessage({
-          type: "loading",
-          file: progress.file,
-          progress: progress.progress,
-          loaded: progress.loaded,
-          total: progress.total,
-          status: `Downloading ${progress.file}...`,
-        });
-      } else if (progress.status === "done") {
-        self.postMessage({
-          type: "loading",
-          progress: 100,
-          status: `Loaded ${progress.file}`,
-        });
-      }
-    },
+    progress_callback: speakerProgressCallback,
   });
 
   currentSpeakerModelKey = key;
@@ -207,11 +221,37 @@ async function loadSpeakerModel({ model, device, quantization }) {
 }
 
 /**
+ * Mean-pool a 3-D hidden-state tensor [1, seqLen, hiddenDim] and
+ * L2-normalise the result, returning a plain Array of length hiddenDim.
+ */
+function meanPoolAndNormalize(data, seqLen, hiddenDim) {
+  const embedding = new Float32Array(hiddenDim);
+  for (let t = 0; t < seqLen; t++) {
+    const offset = t * hiddenDim;
+    for (let d = 0; d < hiddenDim; d++) {
+      embedding[d] += data[offset + d];
+    }
+  }
+  for (let d = 0; d < hiddenDim; d++) embedding[d] /= seqLen;
+
+  let norm = 0;
+  for (let d = 0; d < hiddenDim; d++) norm += embedding[d] * embedding[d];
+  norm = Math.sqrt(norm);
+  if (norm > 0) {
+    for (let d = 0; d < hiddenDim; d++) embedding[d] /= norm;
+  }
+  return Array.from(embedding);
+}
+
+/**
  * Extract speaker embeddings from an array of audio buffers.
- * Returns mean-pooled, L2-normalized embeddings.
+ *
+ * If the model exposes an `embeddings` output (XVector architecture) those
+ * are used directly; otherwise we fall back to mean-pooling the last hidden
+ * state. All embeddings are L2-normalised before being returned.
  */
 async function extractEmbeddings({ audioBuffers }) {
-  if (!speakerExtractor) {
+  if (!speakerModel || !speakerProcessor) {
     self.postMessage({
       type: "error",
       message: "Speaker model not loaded",
@@ -227,12 +267,29 @@ async function extractEmbeddings({ audioBuffers }) {
       total: audioBuffers.length,
     });
 
-    const output = await speakerExtractor(audioBuffers[i], {
-      pooling: "mean",
-      normalize: true,
-    });
+    const inputs = await speakerProcessor(audioBuffers[i]);
+    const output = await speakerModel(inputs);
 
-    embeddings.push(Array.from(output.data));
+    let embedding;
+    if (output.embeddings) {
+      // XVector model — speaker embeddings already computed
+      const raw = Array.from(output.embeddings.data);
+      // L2-normalise
+      let norm = 0;
+      for (let d = 0; d < raw.length; d++) norm += raw[d] * raw[d];
+      norm = Math.sqrt(norm);
+      if (norm > 0) for (let d = 0; d < raw.length; d++) raw[d] /= norm;
+      embedding = raw;
+    } else if (output.last_hidden_state) {
+      // Base model — mean-pool hidden states
+      const hs = output.last_hidden_state;
+      const [, seqLen, hiddenDim] = hs.dims;
+      embedding = meanPoolAndNormalize(hs.data, seqLen, hiddenDim);
+    } else {
+      throw new Error("Unexpected model output format");
+    }
+
+    embeddings.push(embedding);
   }
 
   self.postMessage({ type: "embeddings", embeddings });
