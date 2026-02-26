@@ -6,6 +6,10 @@ env.allowLocalModels = false;
 let transcriber = null;
 let currentModelKey = null;
 
+// Speaker embedding model state
+let speakerExtractor = null;
+let currentSpeakerModelKey = null;
+
 /**
  * Build the HF model id from user settings.
  * English-only models use the ".en" suffix (only available for tiny/base/small).
@@ -147,6 +151,93 @@ async function transcribe({ audio, options, usesMerger, windowOffset }) {
   }
 }
 
+/**
+ * Load (or re-load) the speaker embedding model.
+ */
+async function loadSpeakerModel({ model, device, quantization }) {
+  const key = `${model}|${device}|${quantization}`;
+
+  if (key === currentSpeakerModelKey && speakerExtractor) {
+    self.postMessage({ type: "speaker-model-ready" });
+    return;
+  }
+
+  // Dispose previous speaker model
+  if (speakerExtractor) {
+    try {
+      await speakerExtractor.dispose();
+    } catch {
+      // ignore dispose errors
+    }
+    speakerExtractor = null;
+    currentSpeakerModelKey = null;
+  }
+
+  self.postMessage({
+    type: "loading",
+    progress: 0,
+    status: `Loading speaker model ${model}...`,
+  });
+
+  speakerExtractor = await pipeline("feature-extraction", model, {
+    device,
+    dtype: quantization,
+    progress_callback: (progress) => {
+      if (progress.status === "progress") {
+        self.postMessage({
+          type: "loading",
+          file: progress.file,
+          progress: progress.progress,
+          loaded: progress.loaded,
+          total: progress.total,
+          status: `Downloading ${progress.file}...`,
+        });
+      } else if (progress.status === "done") {
+        self.postMessage({
+          type: "loading",
+          progress: 100,
+          status: `Loaded ${progress.file}`,
+        });
+      }
+    },
+  });
+
+  currentSpeakerModelKey = key;
+  self.postMessage({ type: "speaker-model-ready" });
+}
+
+/**
+ * Extract speaker embeddings from an array of audio buffers.
+ * Returns mean-pooled, L2-normalized embeddings.
+ */
+async function extractEmbeddings({ audioBuffers }) {
+  if (!speakerExtractor) {
+    self.postMessage({
+      type: "error",
+      message: "Speaker model not loaded",
+    });
+    return;
+  }
+
+  const embeddings = [];
+  for (let i = 0; i < audioBuffers.length; i++) {
+    self.postMessage({
+      type: "embedding-progress",
+      current: i + 1,
+      total: audioBuffers.length,
+    });
+
+    const output = await speakerExtractor(audioBuffers[i], {
+      pooling: "mean",
+      normalize: true,
+    });
+
+    embeddings.push(Array.from(output.data));
+  }
+
+  self.postMessage({ type: "embeddings", embeddings });
+}
+
 // Message handler
 self.addEventListener("message", async (e) => {
   const { type, ...data } = e.data;
@@ -161,6 +252,26 @@ self.addEventListener("message", async (e) => {
       break;
     case "transcribe":
       await transcribe(data);
+      break;
+    case "load-speaker-model":
+      try {
+        await loadSpeakerModel(data);
+      } catch (err) {
+        self.postMessage({
+          type: "error",
+          message: `Failed to load speaker model: ${err.message}`,
+        });
+      }
+      break;
+    case "extract-embeddings":
+      try {
+        await extractEmbeddings(data);
+      } catch (err) {
+        self.postMessage({
+          type: "error",
+          message: `Embedding extraction failed: ${err.message}`,
+        });
+      }
       break;
   }
 });

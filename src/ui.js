@@ -123,6 +123,10 @@ export const DEFAULT_SETTINGS = {
   chunkInterval: 10,
   overlapDuration: 3,
   recordingMode: "realtime",
+  speakerModel: "onnx-community/wavlm-base-plus-sv",
+  speakerQuantization: "fp32",
+  speakerThreshold: 0.86,
+  speakerAggregation: "mean",
 };
 
 // ── Settings persistence ──────────────────────────────
@@ -331,6 +335,71 @@ export function buildSettingsModal(container, settings, onSave) {
 
   modal.appendChild(recSection);
 
+  // ── Speaker Recognition section ────
+  const srSection = section("Speaker Recognition");
+
+  srSection.appendChild(
+    textareaField(
+      "Speaker model",
+      "s-speakerModel",
+      settings.speakerModel,
+      "HuggingFace model ID for speaker embeddings...",
+    ),
+  );
+
+  // Make it a single-line textarea visually
+  const srModelTa = srSection.querySelector("#s-speakerModel");
+  if (srModelTa) {
+    srModelTa.style.minHeight = "auto";
+    srModelTa.rows = 1;
+  }
+
+  srSection.appendChild(
+    selectField(
+      "Speaker quantization",
+      "s-speakerQuantization",
+      settings.speakerQuantization,
+      [
+        ["fp32", "fp32"],
+        ["fp16", "fp16"],
+        ["q8", "q8"],
+        ["q4", "q4"],
+      ],
+    ),
+  );
+
+  srSection.appendChild(
+    rangeField(
+      "Similarity threshold",
+      "s-speakerThreshold",
+      settings.speakerThreshold,
+      0.5,
+      1.0,
+      0.01,
+    ),
+  );
+
+  srSection.appendChild(
+    selectField(
+      "Score aggregation",
+      "s-speakerAggregation",
+      settings.speakerAggregation,
+      [
+        ["mean", "Mean"],
+        ["max", "Max"],
+        ["median", "Median"],
+      ],
+    ),
+  );
+
+  const srHint = document.createElement("div");
+  srHint.className = "field__hint";
+  srHint.textContent =
+    "Speaker identification compares sentence embeddings to manually labeled references. Aggregation controls how multiple reference scores per speaker are combined.";
+  srSection.appendChild(srHint);
+
+  modal.appendChild(srSection);
+
   // ── Footer ─────────────────────────
   const footer = document.createElement("div");
   footer.className = "modal__footer";
@@ -377,6 +446,10 @@ export function buildSettingsModal(container, settings, onSave) {
       chunkInterval: intVal("s-chunkInterval"),
       overlapDuration: intVal("s-overlapDuration"),
       recordingMode: settings.recordingMode, // preserved from app state
+      speakerModel: val("s-speakerModel"),
+      speakerQuantization: val("s-speakerQuantization"),
+      speakerThreshold: floatVal("s-speakerThreshold"),
+      speakerAggregation: val("s-speakerAggregation"),
     };
     saveSettings(updated);
     container.classList.remove("modal-backdrop--open");
