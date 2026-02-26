@@ -1,5 +1,6 @@
 /**
- * UI module — settings modal, theme toggle, transcript display helpers.
+ * UI module — settings modal, theme toggle, transcript display helpers,
+ * transcript library storage and modal.
  */
 
 // ── Whisper language list ──────────────────────────────
@@ -128,6 +129,9 @@ export const DEFAULT_SETTINGS = {
 
 const STORAGE_KEY = "scribe_settings";
 const THEME_KEY = "scribe_theme";
+const LIBRARY_INDEX_KEY = "scribe_transcript_index";
+const LIBRARY_PREFIX = "scribe_transcript_";
+const SPEAKER_NAMES_KEY = "scribe_speaker_names";
 
 export function loadSettings() {
   try {
@@ -498,4 +502,350 @@ export function downloadTranscript(text, filename = "transcript.txt") {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+// ── Transcript library storage ────────────────────────
+
+function generateId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function loadLibraryIndex() {
+  try {
+    const raw = localStorage.getItem(LIBRARY_INDEX_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
+function saveLibraryIndex(index) {
+  localStorage.setItem(LIBRARY_INDEX_KEY, JSON.stringify(index));
+}
+
+/**
+ * Save the current transcript sentences to the library.
+ * Returns the generated transcript ID.
+ */
+export function saveTranscriptToLibrary(sentences, title) {
+  const id = generateId();
+  const createdAt = Date.now();
+
+  // Auto-generate title from first sentence if not provided
+  if (!title) {
+    const firstText = sentences[0]?.text || "Untitled";
+    title =
+      firstText.length > 50 ? firstText.slice(0, 50) + "..." : firstText;
+  }
+
+  const transcript = { id, title, createdAt, sentences };
+  localStorage.setItem(LIBRARY_PREFIX + id, JSON.stringify(transcript));
+
+  const index = loadLibraryIndex();
+  index.unshift({ id, title, createdAt, sentenceCount: sentences.length });
+  saveLibraryIndex(index);
+
+  return id;
+}
+
+/**
+ * Load the library index (metadata only).
+ */
+export function loadTranscriptLibrary() {
+  return loadLibraryIndex();
+}
+
+/**
+ * Load a full transcript by ID.
+ */
+export function loadTranscriptById(id) {
+  try {
+    const raw = localStorage.getItem(LIBRARY_PREFIX + id);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * Delete one or more transcripts from the library.
+ */
+export function deleteTranscriptsFromLibrary(ids) {
+  const idSet = new Set(ids);
+  for (const id of idSet) {
+    localStorage.removeItem(LIBRARY_PREFIX + id);
+  }
+  const index = loadLibraryIndex().filter((entry) => !idSet.has(entry.id));
+  saveLibraryIndex(index);
+}
+
+// ── Library modal builder ─────────────────────────────
+
+/**
+ * Build and display the transcript library modal.
+ *
+ * @param {HTMLElement} container   – the modal backdrop element
+ * @param {Function}    onOpen     – called with a full transcript object when user opens one
+ * @param {Function}    onSelect   – called with an array of full transcript objects for batch processing
+ */
+export function buildLibraryModal(container, onOpen, onSelect) {
+  container.innerHTML = "";
+
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.addEventListener("click", (e) => e.stopPropagation());
+
+  // Header
+  const header = document.createElement("div");
+  header.className = "modal__header";
+  header.innerHTML = `
+    <span class="modal__title">Transcript Library</span>
+    <button class="modal__close" aria-label="Close">&times;</button>
+  `;
+  modal.appendChild(header);
+
+  // Body – transcript list
+  const body = document.createElement("div");
+  body.className = "library__body";
+
+  const entries = loadLibraryIndex();
+
+  if (entries.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "library__empty";
+    empty.textContent = "No saved transcripts yet.";
+    body.appendChild(empty);
+  } else {
+    const list = document.createElement("div");
+    list.className = "library__list";
+
+    for (const entry of entries) {
+      const row = document.createElement("div");
+      row.className = "library__item";
+      row.dataset.id = entry.id;
+
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.className = "library__checkbox";
+      cb.dataset.id = entry.id;
+
+      const info = document.createElement("div");
+      info.className = "library__info";
+
+      const titleEl = document.createElement("div");
+      titleEl.className = "library__title";
+      titleEl.textContent = entry.title;
+
+      const meta = document.createElement("div");
+      meta.className = "library__meta";
+      const date = new Date(entry.createdAt);
+      meta.textContent = `${date.toLocaleDateString()} ${date.toLocaleTimeString()} \u2022 ${entry.sentenceCount} sentence${entry.sentenceCount !== 1 ? "s" : ""}`;
+
+      info.appendChild(titleEl);
+      info.appendChild(meta);
+
+      const openBtn = document.createElement("button");
+      openBtn.className = "btn btn--small";
+      openBtn.textContent = "Open";
+      openBtn.addEventListener("click", () => {
+        const transcript = loadTranscriptById(entry.id);
+        if (transcript) {
+          container.classList.remove("modal-backdrop--open");
+          onOpen(transcript);
+        }
+      });
+
+      row.appendChild(cb);
+      row.appendChild(info);
+      row.appendChild(openBtn);
+      list.appendChild(row);
+    }
+
+    body.appendChild(list);
+  }
+
+  modal.appendChild(body);
+
+  // Footer with batch actions
+  const footer = document.createElement("div");
+  footer.className = "modal__footer";
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.className = "btn btn--danger-outline btn--small";
+  deleteBtn.textContent = "Delete Selected";
+  deleteBtn.addEventListener("click", () => {
+    const checked = modal.querySelectorAll(
+      ".library__checkbox:checked",
+    );
+    const ids = Array.from(checked).map((cb) => cb.dataset.id);
+    if (ids.length === 0) return;
+    deleteTranscriptsFromLibrary(ids);
+    // Rebuild the modal to reflect changes
+    buildLibraryModal(container, onOpen, onSelect);
+  });
+
+  const selectBtn = document.createElement("button");
+  selectBtn.className = "btn btn--primary btn--small";
+  selectBtn.textContent = "Process Selected";
+  selectBtn.addEventListener("click", () => {
+    const checked = modal.querySelectorAll(
+      ".library__checkbox:checked",
+    );
+    const ids = Array.from(checked).map((cb) => cb.dataset.id);
+    if (ids.length === 0) return;
+    const transcripts = ids
+      .map((id) => loadTranscriptById(id))
+      .filter(Boolean);
+    container.classList.remove("modal-backdrop--open");
+    onSelect(transcripts);
+  });
+
+  const closeBtn = document.createElement("button");
+  closeBtn.className = "btn btn--small";
+  closeBtn.textContent = "Close";
+  closeBtn.addEventListener("click", () => {
+    container.classList.remove("modal-backdrop--open");
+  });
+
+  footer.appendChild(deleteBtn);
+  footer.appendChild(selectBtn);
+  footer.appendChild(closeBtn);
+  modal.appendChild(footer);
+
+  container.appendChild(modal);
+
+  // Close on X
+  header.querySelector(".modal__close").addEventListener("click", () => {
+    container.classList.remove("modal-backdrop--open");
+  });
+}
+
+// ── Speaker names storage ─────────────────────────────
+
+const SPEAKER_COLORS = [
+  { id: "1", color: "#4a6fa5", label: "Speaker 1" },
+  { id: "2", color: "#27ae60", label: "Speaker 2" },
+  { id: "3", color: "#e67e22", label: "Speaker 3" },
+  { id: "4", color: "#8e44ad", label: "Speaker 4" },
+  { id: "5", color: "#c0392b", label: "Speaker 5" },
+  { id: "6", color: "#16a085", label: "Speaker 6" },
+];
+
+export { SPEAKER_COLORS };
+
+export function loadSpeakerNames() {
+  try {
+    const raw = localStorage.getItem(SPEAKER_NAMES_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    // ignore
+  }
+  return {};
+}
+
+export function saveSpeakerNames(names) {
+  localStorage.setItem(SPEAKER_NAMES_KEY, JSON.stringify(names));
+}
+
+/**
+ * Get the display label for a speaker.
+ * Returns the name if set, otherwise "Speaker N".
+ */
+export function speakerDisplayName(speakerId, names) {
+  if (!speakerId || speakerId === "0") return null;
+  const n = names || loadSpeakerNames();
+  return n[speakerId] || `Speaker ${speakerId}`;
+}
+
+// ── Speaker names modal ──────────────────────────────
+
+/**
+ * Build and display the speaker names mapping modal.
+ *
+ * @param {HTMLElement} container – the modal backdrop element
+ * @param {Function}    onSave   – called with the updated names object
+ */
+export function buildSpeakerNamesModal(container, onSave) {
+  container.innerHTML = "";
+
+  const names = loadSpeakerNames();
+
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.addEventListener("click", (e) => e.stopPropagation());
+
+  // Header
+  const header = document.createElement("div");
+  header.className = "modal__header";
+  header.innerHTML = `
+    <span class="modal__title">Speaker Names</span>
+    <button class="modal__close" aria-label="Close">&times;</button>
+  `;
+  modal.appendChild(header);
+
+  // Body
+  const body = document.createElement("div");
+  body.className = "modal__section";
+
+  for (const speaker of SPEAKER_COLORS) {
+    const row = document.createElement("div");
+    row.className = "speaker-name-row";
+
+    const badge = document.createElement("span");
+    badge.className = "speaker-badge";
+    badge.style.background = speaker.color;
+    badge.textContent = speaker.id;
+
+    const input = document.createElement("input");
+    input.className = "field__input";
+    input.type = "text";
+    input.id = `speaker-name-${speaker.id}`;
+    input.value = names[speaker.id] || "";
+    input.placeholder = speaker.label;
+
+    row.appendChild(badge);
+    row.appendChild(input);
+    body.appendChild(row);
+  }
+
+  modal.appendChild(body);
+
+  // Footer
+  const footer = document.createElement("div");
+  footer.className = "modal__footer";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "btn btn--small";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", () => {
+    container.classList.remove("modal-backdrop--open");
+  });
+
+  const saveBtn = document.createElement("button");
+  saveBtn.className = "btn btn--primary btn--small";
+  saveBtn.textContent = "Save";
+  saveBtn.addEventListener("click", () => {
+    const updated = {};
+    for (const speaker of SPEAKER_COLORS) {
+      const input = modal.querySelector(`#speaker-name-${speaker.id}`);
+      const val = input?.value?.trim();
+      if (val) updated[speaker.id] = val;
+    }
+    saveSpeakerNames(updated);
+    container.classList.remove("modal-backdrop--open");
+    if (onSave) onSave(updated);
+  });
+
+  footer.appendChild(cancelBtn);
+  footer.appendChild(saveBtn);
+  modal.appendChild(footer);
+
+  container.appendChild(modal);
+
+  // Close on X
+  header.querySelector(".modal__close").addEventListener("click", () => {
+    container.classList.remove("modal-backdrop--open");
+  });
 }

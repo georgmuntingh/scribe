@@ -94,7 +94,7 @@ async function loadModel({ model, variant, device, quantization }) {
 /**
  * Run transcription on an audio buffer.
  */
-async function transcribe({ audio, options, usesMerger }) {
+async function transcribe({ audio, options, usesMerger, windowOffset }) {
   if (!transcriber) {
     self.postMessage({ type: "error", message: "Model not loaded" });
     return;
@@ -140,6 +140,7 @@ async function transcribe({ audio, options, usesMerger }) {
       text: result.text,
       chunks: result.chunks || [],
       usesMerger: !!usesMerger,
+      windowOffset: windowOffset ?? 0,
     });
   } catch (err) {
     self.postMessage({ type: "error", message: err.message });

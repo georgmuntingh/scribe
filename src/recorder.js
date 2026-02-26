@@ -81,6 +81,7 @@ export class MicRecorder {
     this.onChunk = null;
     this.onComplete = null;
     this.onError = null;
+    this.onRawSamples = null; // called with each raw PCM chunk (for audio buffer accumulation)
   }
 
   async start(mode, chunkIntervalSeconds, overlapSeconds) {
@@ -160,6 +161,7 @@ export class MicRecorder {
       copy.set(input);
       this._pcmBuffer.push(copy);
       this._pcmSampleCount += copy.length;
+      if (this.onRawSamples) this.onRawSamples(copy);
     };
 
     this._sourceNode.connect(this._processorNode);
@@ -190,6 +192,7 @@ export class MicRecorder {
     // Not enough audio accumulated yet for a full window
     if (this._pcmSampleCount - this._windowStart < windowSamples) return;
 
+    const windowOffsetSeconds = this._windowStart / TARGET_SAMPLE_RATE;
     const audio = this._extractSamples(this._windowStart, windowSamples);
     this._windowStart += stepSamples;
 
@@ -197,7 +200,7 @@ export class MicRecorder {
     this._trimBuffer();
 
     if (this.onChunk && audio.length > 0) {
-      this.onChunk(audio);
+      this.onChunk(audio, windowOffsetSeconds);
     }
   }
 
@@ -287,9 +290,10 @@ export class MicRecorder {
 
     if (count <= 0) return;
 
+    const windowOffsetSeconds = start / TARGET_SAMPLE_RATE;
     const audio = this._extractSamples(start, count);
     if (this.onChunk && audio.length > 0) {
-      this.onChunk(audio);
+      this.onChunk(audio, windowOffsetSeconds);
     }
   }
 
