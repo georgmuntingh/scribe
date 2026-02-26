@@ -190,6 +190,7 @@ export class MicRecorder {
     // Not enough audio accumulated yet for a full window
     if (this._pcmSampleCount - this._windowStart < windowSamples) return;
 
+    const windowOffsetSeconds = this._windowStart / TARGET_SAMPLE_RATE;
     const audio = this._extractSamples(this._windowStart, windowSamples);
     this._windowStart += stepSamples;
 
@@ -197,7 +198,7 @@ export class MicRecorder {
     this._trimBuffer();
 
     if (this.onChunk && audio.length > 0) {
-      this.onChunk(audio);
+      this.onChunk(audio, windowOffsetSeconds);
     }
   }
 
@@ -287,9 +288,10 @@ export class MicRecorder {
 
     if (count <= 0) return;
 
+    const windowOffsetSeconds = start / TARGET_SAMPLE_RATE;
     const audio = this._extractSamples(start, count);
     if (this.onChunk && audio.length > 0) {
-      this.onChunk(audio);
+      this.onChunk(audio, windowOffsetSeconds);
     }
   }
 

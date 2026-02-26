@@ -1,6 +1,6 @@
 import "./style.css";
 import { MicRecorder, decodeAudioFile } from "./recorder.js";
-import { TranscriptMerger } from "./merger.js";
+import { SentenceMerger, formatTimestamp } from "./merger.js";
 import {
   loadSettings,
   saveSettings,
@@ -8,8 +8,13 @@ import {
   cycleTheme,
   themeIcon,
   buildSettingsModal,
+  buildLibraryModal,
   copyTranscript,
   downloadTranscript,
+  saveTranscriptToLibrary,
+  loadTranscriptLibrary,
+  loadTranscriptById,
+  deleteTranscriptsFromLibrary,
 } from "./ui.js";
 
 // ── State ─────────────────────────────────────────────
@@ -23,9 +28,10 @@ const worker = new Worker(new URL("./worker.js", import.meta.url), {
   type: "module",
 });
 
-let transcriptText = "";
+/** @type {Array<{text: string, start: number, end: number, speakerId: string|null}>} */
+let transcriptSentences = [];
 let pendingChunks = 0;
-const merger = new TranscriptMerger();
+const merger = new SentenceMerger();
 
 // ── DOM references ────────────────────────────────────
 
@@ -35,7 +41,9 @@ const modalBackdrop = document.getElementById("modal-backdrop");
 const transcriptEl = document.getElementById("transcript");
 const copyBtn = document.getElementById("copy-btn");
 const downloadBtn = document.getElementById("download-btn");
+const saveBtn = document.getElementById("save-btn");
 const clearBtn = document.getElementById("clear-btn");
+const libraryBtn = document.getElementById("library-btn");
 const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("file-input");
 const recordBtn = document.getElementById("record-btn");
@@ -88,19 +96,23 @@ worker.addEventListener("message", (e) => {
     case "result":
       pendingChunks = Math.max(0, pendingChunks - 1);
       {
-        // Strip Whisper artifacts like [BLANK_AUDIO] before processing
-        const cleaned = (msg.text || "")
-          .replace(/\[BLANK_AUDIO\]/gi, "")
-          .trim();
-        if (cleaned) {
+        const chunks = msg.chunks || [];
+        if (chunks.length > 0) {
           if (msg.usesMerger) {
-            // Real-time overlapping mode: merge into accumulated transcript
-            const merged = merger.add(cleaned);
-            transcriptText = merged;
-            updateTranscriptDisplay();
+            // Real-time overlapping mode: merge using timestamps
+            transcriptSentences = merger.addWindow(
+              chunks,
+              msg.windowOffset ?? 0,
+            );
           } else {
-            appendTranscript(cleaned);
+            // File upload / manual mode: append chunks
+            if (transcriptSentences.length > 0) {
+              transcriptSentences = merger.appendChunks(chunks);
+            } else {
+              transcriptSentences = merger.setChunks(chunks);
+            }
           }
+          updateTranscriptDisplay();
         }
       }
       // If no more pending chunks and not recording, go back to ready
@@ -139,7 +151,10 @@ function loadModel() {
   });
 }
 
-function requestTranscription(audio, { usesMerger = false } = {}) {
+function requestTranscription(
+  audio,
+  { usesMerger = false, windowOffset = 0 } = {},
+) {
   pendingChunks++;
   // Don't change state while recording — real-time chunks are transcribed
   // in the background and the UI should keep showing "Stop".
@@ -152,6 +167,7 @@ function requestTranscription(audio, { usesMerger = false } = {}) {
     type: "transcribe",
     audio,
     usesMerger,
+    windowOffset,
     options: {
       language: settings.language,
       task: settings.task,
@@ -164,8 +180,11 @@ function requestTranscription(audio, { usesMerger = false } = {}) {
 
 // ── Recorder callbacks ────────────────────────────────
 
-recorder.onChunk = (audio) => {
-  requestTranscription(audio, { usesMerger: true });
+recorder.onChunk = (audio, windowOffsetSeconds) => {
+  requestTranscription(audio, {
+    usesMerger: true,
+    windowOffset: windowOffsetSeconds ?? 0,
+  });
 };
 
 recorder.onComplete = (audio) => {
@@ -182,7 +201,7 @@ recorder.onError = (err) => {
 
 function startRecording() {
   if (appState !== "ready") return;
-  transcriptText = "";
+  transcriptSentences = [];
   merger.reset();
   updateTranscriptDisplay();
   appState = "recording";
@@ -227,20 +246,37 @@ async function handleFile(file) {
   }
 }
 
-// ── Transcript ────────────────────────────────────────
+// ── Transcript display ───────────────────────────────
 
-function appendTranscript(text) {
-  if (transcriptText) {
-    transcriptText += "\n" + text;
-  } else {
-    transcriptText = text;
-  }
-  updateTranscriptDisplay();
+function escapeHtml(text) {
+  const el = document.createElement("span");
+  el.textContent = text;
+  return el.innerHTML;
+}
+
+function sentencesToPlainText(sentences) {
+  return sentences
+    .map((s) => {
+      const ts = `[${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}]`;
+      return `${ts} ${s.text}`;
+    })
+    .join("\n");
 }
 
 function updateTranscriptDisplay() {
-  if (transcriptText) {
-    transcriptEl.textContent = transcriptText;
+  if (transcriptSentences.length > 0) {
+    transcriptEl.innerHTML = transcriptSentences
+      .map((s, i) => {
+        const ts = `[${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}]`;
+        const speaker = s.speakerId || "";
+        return (
+          `<div class="sentence" data-sentence-id="s${i}" data-speaker="${escapeHtml(speaker)}">` +
+          `<span class="sentence__time">${escapeHtml(ts)}</span> ` +
+          `<span class="sentence__text">${escapeHtml(s.text)}</span>` +
+          `</div>`
+        );
+      })
+      .join("");
     transcriptEl.classList.remove("transcript--empty");
     // Auto-scroll to bottom
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
@@ -288,10 +324,13 @@ function updateControls() {
     recordBtn.classList.add("btn--primary");
   }
 
+  const hasContent = transcriptSentences.length > 0;
+  copyBtn.disabled = !hasContent;
+  downloadBtn.disabled = !hasContent;
+  saveBtn.disabled = !hasContent;
+  clearBtn.disabled = !hasContent;
+
   const canInteract = isReady || appState === "transcribing";
-  copyBtn.disabled = !transcriptText;
-  downloadBtn.disabled = !transcriptText;
-  clearBtn.disabled = !transcriptText;
   dropzone.style.pointerEvents = canInteract ? "auto" : "none";
   dropzone.style.opacity = canInteract ? "1" : "0.5";
 }
@@ -361,9 +400,9 @@ modeManual.addEventListener("click", () => {
 
 // Copy
 copyBtn.addEventListener("click", async () => {
-  if (!transcriptText) return;
+  if (transcriptSentences.length === 0) return;
   try {
-    await copyTranscript(transcriptText);
+    await copyTranscript(sentencesToPlainText(transcriptSentences));
     const orig = copyBtn.textContent;
     copyBtn.textContent = "Copied!";
     setTimeout(() => (copyBtn.textContent = orig), 1500);
@@ -374,16 +413,48 @@ copyBtn.addEventListener("click", async () => {
 
 // Download
 downloadBtn.addEventListener("click", () => {
-  if (!transcriptText) return;
-  downloadTranscript(transcriptText);
+  if (transcriptSentences.length === 0) return;
+  downloadTranscript(sentencesToPlainText(transcriptSentences));
+});
+
+// Save to library
+saveBtn.addEventListener("click", () => {
+  if (transcriptSentences.length === 0) return;
+  saveTranscriptToLibrary(transcriptSentences);
+  const orig = saveBtn.textContent;
+  saveBtn.textContent = "Saved!";
+  setTimeout(() => (saveBtn.textContent = orig), 1500);
+  setStatus("Transcript saved to library.");
 });
 
 // Clear
 clearBtn.addEventListener("click", () => {
-  transcriptText = "";
+  transcriptSentences = [];
   merger.reset();
   updateTranscriptDisplay();
   updateControls();
+});
+
+// Library modal
+libraryBtn.addEventListener("click", () => {
+  buildLibraryModal(
+    modalBackdrop,
+    // onOpen: load a single transcript into the display
+    (transcript) => {
+      transcriptSentences = transcript.sentences;
+      merger.reset();
+      updateTranscriptDisplay();
+      updateControls();
+      setStatus(`Opened: ${transcript.title}`);
+    },
+    // onDelete: handled internally by the modal
+    // onSelect: return selected transcript data for future processing
+    (selectedTranscripts) => {
+      setStatus(`${selectedTranscripts.length} transcript(s) selected for processing.`);
+      // Future: wire into processing pipeline
+    },
+  );
+  modalBackdrop.classList.add("modal-backdrop--open");
 });
 
 // File drop zone
