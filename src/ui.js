@@ -131,6 +131,7 @@ const STORAGE_KEY = "scribe_settings";
 const THEME_KEY = "scribe_theme";
 const LIBRARY_INDEX_KEY = "scribe_transcript_index";
 const LIBRARY_PREFIX = "scribe_transcript_";
+const SPEAKER_NAMES_KEY = "scribe_speaker_names";
 
 export function loadSettings() {
   try {
@@ -711,6 +712,134 @@ export function buildLibraryModal(container, onOpen, onSelect) {
   footer.appendChild(deleteBtn);
   footer.appendChild(selectBtn);
   footer.appendChild(closeBtn);
+  modal.appendChild(footer);
+
+  container.appendChild(modal);
+
+  // Close on X
+  header.querySelector(".modal__close").addEventListener("click", () => {
+    container.classList.remove("modal-backdrop--open");
+  });
+}
+
+// ── Speaker names storage ─────────────────────────────
+
+const SPEAKER_COLORS = [
+  { id: "1", color: "#4a6fa5", label: "Speaker 1" },
+  { id: "2", color: "#27ae60", label: "Speaker 2" },
+  { id: "3", color: "#e67e22", label: "Speaker 3" },
+  { id: "4", color: "#8e44ad", label: "Speaker 4" },
+  { id: "5", color: "#c0392b", label: "Speaker 5" },
+  { id: "6", color: "#16a085", label: "Speaker 6" },
+];
+
+export { SPEAKER_COLORS };
+
+export function loadSpeakerNames() {
+  try {
+    const raw = localStorage.getItem(SPEAKER_NAMES_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    // ignore
+  }
+  return {};
+}
+
+export function saveSpeakerNames(names) {
+  localStorage.setItem(SPEAKER_NAMES_KEY, JSON.stringify(names));
+}
+
+/**
+ * Get the display label for a speaker.
+ * Returns the name if set, otherwise "Speaker N".
+ */
+export function speakerDisplayName(speakerId, names) {
+  if (!speakerId || speakerId === "0") return null;
+  const n = names || loadSpeakerNames();
+  return n[speakerId] || `Speaker ${speakerId}`;
+}
+
+// ── Speaker names modal ──────────────────────────────
+
+/**
+ * Build and display the speaker names mapping modal.
+ *
+ * @param {HTMLElement} container – the modal backdrop element
+ * @param {Function}    onSave   – called with the updated names object
+ */
+export function buildSpeakerNamesModal(container, onSave) {
+  container.innerHTML = "";
+
+  const names = loadSpeakerNames();
+
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.addEventListener("click", (e) => e.stopPropagation());
+
+  // Header
+  const header = document.createElement("div");
+  header.className = "modal__header";
+  header.innerHTML = `
+    <span class="modal__title">Speaker Names</span>
+    <button class="modal__close" aria-label="Close">&times;</button>
+  `;
+  modal.appendChild(header);
+
+  // Body
+  const body = document.createElement("div");
+  body.className = "modal__section";
+
+  for (const speaker of SPEAKER_COLORS) {
+    const row = document.createElement("div");
+    row.className = "speaker-name-row";
+
+    const badge = document.createElement("span");
+    badge.className = "speaker-badge";
+    badge.style.background = speaker.color;
+    badge.textContent = speaker.id;
+
+    const input = document.createElement("input");
+    input.className = "field__input";
+    input.type = "text";
+    input.id = `speaker-name-${speaker.id}`;
+    input.value = names[speaker.id] || "";
+    input.placeholder = speaker.label;
+
+    row.appendChild(badge);
+    row.appendChild(input);
+    body.appendChild(row);
+  }
+
+  modal.appendChild(body);
+
+  // Footer
+  const footer = document.createElement("div");
+  footer.className = "modal__footer";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "btn btn--small";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", () => {
+    container.classList.remove("modal-backdrop--open");
+  });
+
+  const saveBtn = document.createElement("button");
+  saveBtn.className = "btn btn--primary btn--small";
+  saveBtn.textContent = "Save";
+  saveBtn.addEventListener("click", () => {
+    const updated = {};
+    for (const speaker of SPEAKER_COLORS) {
+      const input = modal.querySelector(`#speaker-name-${speaker.id}`);
+      const val = input?.value?.trim();
+      if (val) updated[speaker.id] = val;
+    }
+    saveSpeakerNames(updated);
+    container.classList.remove("modal-backdrop--open");
+    if (onSave) onSave(updated);
+  });
+
+  footer.appendChild(cancelBtn);
+  footer.appendChild(saveBtn);
   modal.appendChild(footer);
 
   container.appendChild(modal);

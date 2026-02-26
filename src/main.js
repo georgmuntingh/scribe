@@ -9,19 +9,30 @@ import {
   themeIcon,
   buildSettingsModal,
   buildLibraryModal,
+  buildSpeakerNamesModal,
   copyTranscript,
   downloadTranscript,
   saveTranscriptToLibrary,
   loadTranscriptLibrary,
   loadTranscriptById,
   deleteTranscriptsFromLibrary,
+  SPEAKER_COLORS,
+  loadSpeakerNames,
+  speakerDisplayName,
 } from "./ui.js";
+
+// ── Constants ─────────────────────────────────────────
+
+const SAMPLE_RATE = 16000;
+const MAX_AUDIO_DURATION_S = 60 * 60; // 60 minutes
+const MAX_AUDIO_SAMPLES = MAX_AUDIO_DURATION_S * SAMPLE_RATE;
 
 // ── State ─────────────────────────────────────────────
 
 let settings = loadSettings();
 let theme = initTheme();
 let appState = "idle"; // idle | loading | ready | recording | transcribing
+let speakerNames = loadSpeakerNames();
 
 const recorder = new MicRecorder();
 const worker = new Worker(new URL("./worker.js", import.meta.url), {
@@ -33,10 +44,21 @@ let transcriptSentences = [];
 let pendingChunks = 0;
 const merger = new SentenceMerger();
 
+// Selection state
+let selectedIndices = new Set();
+let lastClickedIndex = null;
+
+// Audio buffer — retains full audio for waveform slicing (capped at 60 min)
+let audioBufferSource = null; // Float32Array for file uploads
+let micAudioChunks = []; // Array of Float32Array chunks for mic recording
+let micAudioSampleCount = 0;
+let micAudioBaseOffset = 0; // absolute sample offset of first retained chunk
+
 // ── DOM references ────────────────────────────────────
 
 const themeBtn = document.getElementById("theme-btn");
 const settingsBtn = document.getElementById("settings-btn");
+const speakersBtn = document.getElementById("speakers-btn");
 const modalBackdrop = document.getElementById("modal-backdrop");
 const transcriptEl = document.getElementById("transcript");
 const copyBtn = document.getElementById("copy-btn");
@@ -54,6 +76,43 @@ const progressFill = document.getElementById("progress-fill");
 const progressText = document.getElementById("progress-text");
 const statusEl = document.getElementById("status");
 
+// ── Speaker toolbar (created dynamically) ─────────────
+
+const speakerToolbar = document.createElement("div");
+speakerToolbar.className = "speaker-toolbar";
+speakerToolbar.style.display = "none";
+
+// "?" button for unclassified (speaker 0)
+const unclassifiedBtn = document.createElement("button");
+unclassifiedBtn.className = "speaker-btn speaker-btn--unclassified";
+unclassifiedBtn.textContent = "?";
+unclassifiedBtn.title = "Unknown / unclassified";
+unclassifiedBtn.addEventListener("click", () => assignSpeaker("0"));
+speakerToolbar.appendChild(unclassifiedBtn);
+
+// Speaker 1-6 buttons
+for (const sp of SPEAKER_COLORS) {
+  const btn = document.createElement("button");
+  btn.className = "speaker-btn";
+  btn.textContent = sp.id;
+  btn.style.setProperty("--speaker-color", sp.color);
+  btn.title = speakerDisplayName(sp.id, speakerNames) || sp.label;
+  btn.dataset.speakerId = sp.id;
+  btn.addEventListener("click", () => assignSpeaker(sp.id));
+  speakerToolbar.appendChild(btn);
+}
+
+// Edit names button
+const editNamesBtn = document.createElement("button");
+editNamesBtn.className = "speaker-btn speaker-btn--edit";
+editNamesBtn.innerHTML = "&#x270E;"; // pencil
+editNamesBtn.title = "Edit speaker names";
+editNamesBtn.addEventListener("click", openSpeakerNamesModal);
+speakerToolbar.appendChild(editNamesBtn);
+
+// Insert toolbar before transcript element
+transcriptEl.parentNode.insertBefore(speakerToolbar, transcriptEl);
+
 // ── Init ──────────────────────────────────────────────
 
 function init() {
@@ -62,7 +121,6 @@ function init() {
   updateTranscriptDisplay();
   setStatus("Select a model and start recording or upload a file.");
 
-  // Check WebGPU availability
   if (!navigator.gpu) {
     if (settings.device === "webgpu") {
       settings.device = "wasm";
@@ -70,7 +128,6 @@ function init() {
     }
   }
 
-  // Load the model immediately
   loadModel();
 }
 
@@ -99,23 +156,23 @@ worker.addEventListener("message", (e) => {
         const chunks = msg.chunks || [];
         if (chunks.length > 0) {
           if (msg.usesMerger) {
-            // Real-time overlapping mode: merge using timestamps
             transcriptSentences = merger.addWindow(
               chunks,
               msg.windowOffset ?? 0,
             );
           } else {
-            // File upload / manual mode: append chunks
             if (transcriptSentences.length > 0) {
               transcriptSentences = merger.appendChunks(chunks);
             } else {
               transcriptSentences = merger.setChunks(chunks);
             }
           }
+          // Clear selection on content change (sentences may have shifted)
+          selectedIndices.clear();
+          lastClickedIndex = null;
           updateTranscriptDisplay();
         }
       }
-      // If no more pending chunks and not recording, go back to ready
       if (pendingChunks <= 0 && appState === "transcribing") {
         appState = "ready";
         setStatus("Transcription complete.");
@@ -156,8 +213,6 @@ function requestTranscription(
   { usesMerger = false, windowOffset = 0 } = {},
 ) {
   pendingChunks++;
-  // Don't change state while recording — real-time chunks are transcribed
-  // in the background and the UI should keep showing "Stop".
   if (appState !== "recording") {
     appState = "transcribing";
     setStatus("Transcribing...");
@@ -176,6 +231,71 @@ function requestTranscription(
       initialPrompt: settings.initialPrompt,
     },
   });
+}
+
+// ── Audio buffer management ───────────────────────────
+
+recorder.onRawSamples = (chunk) => {
+  micAudioChunks.push(chunk);
+  micAudioSampleCount += chunk.length;
+  // Trim from front if exceeding 60-minute cap
+  while (
+    micAudioSampleCount > MAX_AUDIO_SAMPLES &&
+    micAudioChunks.length > 1
+  ) {
+    const removed = micAudioChunks.shift();
+    micAudioSampleCount -= removed.length;
+    micAudioBaseOffset += removed.length;
+  }
+};
+
+/**
+ * Get a slice of audio for a given time range (seconds).
+ * Returns a Float32Array or null if no audio is available.
+ */
+export function getAudioSlice(startSec, endSec) {
+  if (audioBufferSource) {
+    const s = Math.max(0, Math.round(startSec * SAMPLE_RATE));
+    const e = Math.min(audioBufferSource.length, Math.round(endSec * SAMPLE_RATE));
+    if (e <= s) return null;
+    return audioBufferSource.slice(s, e);
+  }
+
+  if (micAudioChunks.length === 0) return null;
+
+  const startSample = Math.round(startSec * SAMPLE_RATE);
+  const endSample = Math.round(endSec * SAMPLE_RATE);
+  const count = endSample - startSample;
+  if (count <= 0) return null;
+
+  const result = new Float32Array(count);
+  let written = 0;
+  let chunkAbsOffset = micAudioBaseOffset;
+
+  for (const chunk of micAudioChunks) {
+    const chunkEnd = chunkAbsOffset + chunk.length;
+    if (chunkEnd <= startSample) {
+      chunkAbsOffset = chunkEnd;
+      continue;
+    }
+    if (chunkAbsOffset >= endSample) break;
+
+    const readStart = Math.max(0, startSample - chunkAbsOffset);
+    const readEnd = Math.min(chunk.length, endSample - chunkAbsOffset);
+    const segment = chunk.subarray(readStart, readEnd);
+    result.set(segment, written);
+    written += segment.length;
+    chunkAbsOffset = chunkEnd;
+  }
+
+  return result;
+}
+
+function resetAudioBuffer() {
+  audioBufferSource = null;
+  micAudioChunks = [];
+  micAudioSampleCount = 0;
+  micAudioBaseOffset = 0;
 }
 
 // ── Recorder callbacks ────────────────────────────────
@@ -203,6 +323,9 @@ function startRecording() {
   if (appState !== "ready") return;
   transcriptSentences = [];
   merger.reset();
+  selectedIndices.clear();
+  lastClickedIndex = null;
+  resetAudioBuffer();
   updateTranscriptDisplay();
   appState = "recording";
   updateControls();
@@ -240,6 +363,11 @@ async function handleFile(file) {
   setStatus(`Processing ${file.name}...`);
   try {
     const audio = await decodeAudioFile(file);
+    // Store full audio for waveform slicing
+    audioBufferSource = audio;
+    micAudioChunks = [];
+    micAudioSampleCount = 0;
+    micAudioBaseOffset = 0;
     requestTranscription(audio);
   } catch (err) {
     setStatus(`Failed to decode file: ${err.message}`);
@@ -255,35 +383,160 @@ function escapeHtml(text) {
 }
 
 function sentencesToPlainText(sentences) {
+  const names = speakerNames;
   return sentences
     .map((s) => {
       const ts = `[${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}]`;
-      return `${ts} ${s.text}`;
+      const name = speakerDisplayName(s.speakerId, names);
+      const prefix = name ? `${name}: ` : "";
+      return `${ts} ${prefix}${s.text}`;
     })
     .join("\n");
 }
 
 function updateTranscriptDisplay() {
   if (transcriptSentences.length > 0) {
+    const names = speakerNames;
     transcriptEl.innerHTML = transcriptSentences
       .map((s, i) => {
         const ts = `[${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}]`;
         const speaker = s.speakerId || "";
+        const name = speakerDisplayName(s.speakerId, names);
+        const nameHtml = name
+          ? `<span class="sentence__speaker">${escapeHtml(name)}:</span> `
+          : "";
+        const selected = selectedIndices.has(i) ? " sentence--selected" : "";
         return (
-          `<div class="sentence" data-sentence-id="s${i}" data-speaker="${escapeHtml(speaker)}">` +
+          `<div class="sentence${selected}" data-sentence-id="s${i}" data-speaker="${escapeHtml(speaker)}">` +
           `<span class="sentence__time">${escapeHtml(ts)}</span> ` +
+          nameHtml +
           `<span class="sentence__text">${escapeHtml(s.text)}</span>` +
           `</div>`
         );
       })
       .join("");
     transcriptEl.classList.remove("transcript--empty");
-    // Auto-scroll to bottom
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
   } else {
     transcriptEl.textContent = "Transcript will appear here...";
     transcriptEl.classList.add("transcript--empty");
   }
+  updateSpeakerToolbar();
+}
+
+// ── Sentence selection ────────────────────────────────
+
+transcriptEl.addEventListener("click", (e) => {
+  const sentenceEl = e.target.closest(".sentence");
+  if (!sentenceEl) {
+    // Clicked empty space — clear selection
+    selectedIndices.clear();
+    lastClickedIndex = null;
+    updateSelectionDisplay();
+    updateSpeakerToolbar();
+    return;
+  }
+
+  const idStr = sentenceEl.dataset.sentenceId;
+  const index = parseInt(idStr.replace("s", ""), 10);
+  if (isNaN(index)) return;
+
+  if (e.shiftKey && lastClickedIndex != null) {
+    // Range select
+    const from = Math.min(lastClickedIndex, index);
+    const to = Math.max(lastClickedIndex, index);
+    if (!e.ctrlKey && !e.metaKey) selectedIndices.clear();
+    for (let i = from; i <= to; i++) selectedIndices.add(i);
+  } else if (e.ctrlKey || e.metaKey) {
+    // Toggle individual
+    if (selectedIndices.has(index)) {
+      selectedIndices.delete(index);
+    } else {
+      selectedIndices.add(index);
+    }
+  } else {
+    // Single select
+    selectedIndices.clear();
+    selectedIndices.add(index);
+  }
+
+  lastClickedIndex = index;
+  updateSelectionDisplay();
+  updateSpeakerToolbar();
+});
+
+function updateSelectionDisplay() {
+  const sentenceEls = transcriptEl.querySelectorAll(".sentence");
+  sentenceEls.forEach((el) => {
+    const idStr = el.dataset.sentenceId;
+    const idx = parseInt(idStr.replace("s", ""), 10);
+    el.classList.toggle("sentence--selected", selectedIndices.has(idx));
+  });
+}
+
+function updateSpeakerToolbar() {
+  speakerToolbar.style.display =
+    selectedIndices.size > 0 ? "flex" : "none";
+}
+
+// ── Speaker assignment ────────────────────────────────
+
+function assignSpeaker(speakerId) {
+  for (const idx of selectedIndices) {
+    if (idx >= transcriptSentences.length) continue;
+    const s = transcriptSentences[idx];
+    s.speakerId = speakerId;
+    // Persist in the merger's label store
+    merger.setSpeakerLabel(s.start, s.end, speakerId);
+    // Update DOM element in place
+    const el = transcriptEl.querySelector(`[data-sentence-id="s${idx}"]`);
+    if (el) {
+      el.dataset.speaker = speakerId;
+      // Update speaker name
+      const existingNameEl = el.querySelector(".sentence__speaker");
+      const name = speakerDisplayName(speakerId, speakerNames);
+      if (name) {
+        if (existingNameEl) {
+          existingNameEl.textContent = name + ":";
+        } else {
+          const nameSpan = document.createElement("span");
+          nameSpan.className = "sentence__speaker";
+          nameSpan.textContent = name + ":";
+          const timeEl = el.querySelector(".sentence__time");
+          timeEl.insertAdjacentElement("afterend", nameSpan);
+          // Add a space text node after the name
+          nameSpan.insertAdjacentText("afterend", " ");
+        }
+      } else if (existingNameEl) {
+        existingNameEl.remove();
+      }
+    }
+  }
+  // Clear selection after assignment
+  selectedIndices.clear();
+  lastClickedIndex = null;
+  updateSelectionDisplay();
+  updateSpeakerToolbar();
+}
+
+// ── Speaker names modal ───────────────────────────────
+
+function openSpeakerNamesModal() {
+  buildSpeakerNamesModal(modalBackdrop, (updatedNames) => {
+    speakerNames = updatedNames;
+    // Update toolbar button tooltips
+    for (const sp of SPEAKER_COLORS) {
+      const btn = speakerToolbar.querySelector(
+        `[data-speaker-id="${sp.id}"]`,
+      );
+      if (btn) {
+        btn.title = speakerDisplayName(sp.id, speakerNames) || sp.label;
+      }
+    }
+    // Re-render transcript to update speaker names
+    updateTranscriptDisplay();
+  });
+  modalBackdrop.classList.add("modal-backdrop--open");
 }
 
 // ── Progress ──────────────────────────────────────────
@@ -371,6 +624,9 @@ settingsBtn.addEventListener("click", () => {
   modalBackdrop.classList.add("modal-backdrop--open");
 });
 
+// Speakers names modal (header icon)
+speakersBtn.addEventListener("click", openSpeakerNamesModal);
+
 // Close modal on backdrop click
 modalBackdrop.addEventListener("click", () => {
   modalBackdrop.classList.remove("modal-backdrop--open");
@@ -431,6 +687,9 @@ saveBtn.addEventListener("click", () => {
 clearBtn.addEventListener("click", () => {
   transcriptSentences = [];
   merger.reset();
+  selectedIndices.clear();
+  lastClickedIndex = null;
+  resetAudioBuffer();
   updateTranscriptDisplay();
   updateControls();
 });
@@ -439,19 +698,19 @@ clearBtn.addEventListener("click", () => {
 libraryBtn.addEventListener("click", () => {
   buildLibraryModal(
     modalBackdrop,
-    // onOpen: load a single transcript into the display
     (transcript) => {
       transcriptSentences = transcript.sentences;
       merger.reset();
+      selectedIndices.clear();
+      lastClickedIndex = null;
       updateTranscriptDisplay();
       updateControls();
       setStatus(`Opened: ${transcript.title}`);
     },
-    // onDelete: handled internally by the modal
-    // onSelect: return selected transcript data for future processing
     (selectedTranscripts) => {
-      setStatus(`${selectedTranscripts.length} transcript(s) selected for processing.`);
-      // Future: wire into processing pipeline
+      setStatus(
+        `${selectedTranscripts.length} transcript(s) selected for processing.`,
+      );
     },
   );
   modalBackdrop.classList.add("modal-backdrop--open");

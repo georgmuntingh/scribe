@@ -81,6 +81,7 @@ export class MicRecorder {
     this.onChunk = null;
     this.onComplete = null;
     this.onError = null;
+    this.onRawSamples = null; // called with each raw PCM chunk (for audio buffer accumulation)
   }
 
   async start(mode, chunkIntervalSeconds, overlapSeconds) {
@@ -160,6 +161,7 @@ export class MicRecorder {
       copy.set(input);
       this._pcmBuffer.push(copy);
       this._pcmSampleCount += copy.length;
+      if (this.onRawSamples) this.onRawSamples(copy);
     };
 
     this._sourceNode.connect(this._processorNode);

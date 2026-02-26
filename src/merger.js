@@ -6,8 +6,8 @@
  *
  * For file / manual mode: aggregates Whisper chunks into sentences.
  *
- * Each sentence carries a start/end time and a placeholder for a future
- * speaker ID, making the data model ready for speaker-diarisation colouring.
+ * Each sentence carries a start/end time and a speaker ID.  Speaker labels
+ * are preserved across merger rebuilds using timestamp-range matching.
  */
 
 // ── Helpers ──────────────────────────────────────────
@@ -32,7 +32,6 @@ export function formatTimestamp(seconds) {
  * Returns an array of non-empty sentence strings.
  */
 function splitTextAtSentenceBoundaries(text) {
-  // Split after sentence-ending punctuation that is followed by whitespace
   const parts = text.split(/(?<=[.!?])\s+/);
   return parts.map((s) => s.trim()).filter(Boolean);
 }
@@ -48,9 +47,8 @@ function splitTextAtSentenceBoundaries(text) {
 export function aggregateIntoSentences(chunks) {
   if (!chunks || chunks.length === 0) return [];
 
-  // Build a single text string and record which chunk each character belongs to.
   let fullText = "";
-  const charToChunk = []; // index into `chunks` for each char position
+  const charToChunk = [];
 
   for (let i = 0; i < chunks.length; i++) {
     const t = chunks[i].text;
@@ -106,7 +104,6 @@ export function aggregateIntoSentences(chunks) {
     });
   }
 
-  // Fallback: if sentence splitting produced nothing, use the whole text
   if (sentences.length === 0 && trimmed) {
     sentences.push({
       text: trimmed,
@@ -125,27 +122,84 @@ export function aggregateIntoSentences(chunks) {
  * Accumulates Whisper chunks across overlapping audio windows and
  * produces an array of sentences with absolute timestamps.
  *
- * Usage (real-time mode):
- *   const merger = new SentenceMerger();
- *   recorder.onChunk = (audio, windowOffset) => { ... };
- *   // After each worker result:
- *   const sentences = merger.addWindow(whisperChunks, windowOffset);
- *
- * Usage (file / manual mode):
- *   const sentences = merger.setChunks(whisperChunks);
+ * Speaker labels are stored independently and re-applied to sentences
+ * after each rebuild, using timestamp-range overlap matching.
  */
 export class SentenceMerger {
   constructor() {
     /** @type {Array<{text: string, start: number, end: number}>} */
     this._chunks = [];
+
+    /**
+     * Preserved speaker labels keyed by time range.
+     * @type {Array<{start: number, end: number, speakerId: string}>}
+     */
+    this._speakerLabels = [];
+  }
+
+  /**
+   * Record a speaker assignment for a sentence's time range.
+   * Called when the user assigns a speaker to one or more sentences.
+   *
+   * @param {number} start  – sentence start time (seconds)
+   * @param {number} end    – sentence end time (seconds)
+   * @param {string|null} speakerId – speaker ID ("1"-"6"), "0" for unclassified, or null to remove
+   */
+  setSpeakerLabel(start, end, speakerId) {
+    // Remove any existing label that substantially overlaps this range
+    this._speakerLabels = this._speakerLabels.filter((l) => {
+      const overlapStart = Math.max(l.start, start);
+      const overlapEnd = Math.min(l.end, end);
+      const overlap = Math.max(0, overlapEnd - overlapStart);
+      const lDuration = l.end - l.start;
+      // Remove if >50% of the old label is covered by the new assignment
+      return lDuration > 0 && overlap / lDuration < 0.5;
+    });
+    if (speakerId != null) {
+      this._speakerLabels.push({ start, end, speakerId });
+    }
+  }
+
+  /**
+   * Find the best matching speaker label for a given time range.
+   * Requires at least 50% overlap with the sentence duration.
+   */
+  _findBestLabel(start, end) {
+    const duration = end - start;
+    if (duration <= 0) return null;
+
+    let best = null;
+    let bestOverlap = 0;
+
+    for (const label of this._speakerLabels) {
+      const overlapStart = Math.max(start, label.start);
+      const overlapEnd = Math.min(end, label.end);
+      const overlap = Math.max(0, overlapEnd - overlapStart);
+      if (overlap > bestOverlap && overlap >= duration * 0.5) {
+        best = label;
+        bestOverlap = overlap;
+      }
+    }
+
+    return best;
+  }
+
+  /**
+   * Build sentences from chunks and apply preserved speaker labels.
+   */
+  sentences() {
+    const sentences = aggregateIntoSentences(this._chunks);
+    for (const s of sentences) {
+      const match = this._findBestLabel(s.start, s.end);
+      if (match) {
+        s.speakerId = match.speakerId;
+      }
+    }
+    return sentences;
   }
 
   /**
    * Add chunks from a real-time audio window.
-   *
-   * @param {Array} whisperChunks – raw Whisper chunks [{text, timestamp: [start, end]}]
-   * @param {number} windowOffset – absolute start time of the audio window (seconds)
-   * @returns {Array} Current sentence list.
    */
   addWindow(whisperChunks, windowOffset) {
     if (!whisperChunks || whisperChunks.length === 0) return this.sentences();
@@ -161,10 +215,7 @@ export class SentenceMerger {
 
     if (absChunks.length === 0) return this.sentences();
 
-    // Remove existing chunks that end after the new window's start.
-    // These fall in the overlap region and are re-transcribed by the new window.
     this._chunks = this._chunks.filter((c) => c.end <= windowOffset);
-
     this._chunks.push(...absChunks);
     this._chunks.sort((a, b) => a.start - b.start);
 
@@ -173,10 +224,6 @@ export class SentenceMerger {
 
   /**
    * Set chunks directly (file upload or manual recording).
-   * Replaces any existing chunks.
-   *
-   * @param {Array} whisperChunks – raw Whisper chunks
-   * @returns {Array} Sentence list.
    */
   setChunks(whisperChunks) {
     this._chunks = [];
@@ -191,11 +238,7 @@ export class SentenceMerger {
   }
 
   /**
-   * Append chunks (e.g. a second file upload appended to the current transcript).
-   * Timestamps are offset so they follow the existing chunks.
-   *
-   * @param {Array} whisperChunks – raw Whisper chunks
-   * @returns {Array} Sentence list.
+   * Append chunks (e.g. a second file upload).
    */
   appendChunks(whisperChunks) {
     const timeOffset =
@@ -215,23 +258,17 @@ export class SentenceMerger {
   }
 
   /**
-   * Return the current sentences.
-   */
-  sentences() {
-    return aggregateIntoSentences(this._chunks);
-  }
-
-  /**
-   * Return a copy of the raw chunks (useful for persistence).
+   * Return a copy of the raw chunks.
    */
   chunks() {
     return this._chunks.map((c) => ({ ...c }));
   }
 
   /**
-   * Reset for a new recording / transcription session.
+   * Reset for a new session.
    */
   reset() {
     this._chunks = [];
+    this._speakerLabels = [];
   }
 }
