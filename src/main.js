@@ -192,7 +192,11 @@ worker.addEventListener("message", (e) => {
       if (pendingEmbeddingRequest) {
         setStatus("Extracting speaker embeddings...");
         const audioBuffers = pendingEmbeddingRequest.map((it) => it.audio);
-        worker.postMessage({ type: "extract-embeddings", audioBuffers });
+        worker.postMessage({
+          type: "extract-embeddings",
+          audioBuffers,
+          maxChunkSeconds: settings.speakerMaxChunkSeconds,
+        });
       }
       break;
 
