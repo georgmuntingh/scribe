@@ -531,6 +531,16 @@ body {
 .sentence[data-speaker="6"] .sentence__speaker { color: #16a085; }
 .sentence[data-speaker="6"] { border-left-color: #16a085; }
 
+/* Inferred speaker labels: dashed border + italic speaker name */
+.sentence--inferred {
+  border-left-style: dashed;
+}
+
+.sentence--inferred .sentence__speaker {
+  font-style: italic;
+  opacity: 0.85;
+}
+
 /* When selected, override the speaker border with accent */
 .sentence--selected {
   border-left-color: var(--accent) !important;

@@ -48,6 +48,10 @@ const merger = new SentenceMerger();
 let selectedIndices = new Set();
 let lastClickedIndex = null;
 
+// Speaker identification state
+let identificationInProgress = false;
+let pendingEmbeddingRequest = null;
+
 // Audio buffer — retains full audio for waveform slicing (capped at 60 min)
 let audioBufferSource = null; // Float32Array for file uploads
 let micAudioChunks = []; // Array of Float32Array chunks for mic recording
@@ -65,6 +69,7 @@ const copyBtn = document.getElementById("copy-btn");
 const downloadBtn = document.getElementById("download-btn");
 const saveBtn = document.getElementById("save-btn");
 const clearBtn = document.getElementById("clear-btn");
+const identifyBtn = document.getElementById("identify-btn");
 const libraryBtn = document.getElementById("library-btn");
 const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("file-input");
@@ -138,7 +143,9 @@ worker.addEventListener("message", (e) => {
 
   switch (msg.type) {
     case "loading":
-      appState = "loading";
+      if (!identificationInProgress) {
+        appState = "loading";
+      }
       showProgress(msg.progress, msg.status);
       updateControls();
       break;
@@ -180,9 +187,38 @@ worker.addEventListener("message", (e) => {
       }
       break;
 
+    case "speaker-model-ready":
+      hideProgress();
+      if (pendingEmbeddingRequest) {
+        setStatus("Extracting speaker embeddings...");
+        const audioBuffers = pendingEmbeddingRequest.map((it) => it.audio);
+        worker.postMessage({ type: "extract-embeddings", audioBuffers });
+      }
+      break;
+
+    case "embedding-progress":
+      showProgress(
+        (msg.current / msg.total) * 100,
+        `Embedding ${msg.current}/${msg.total}`,
+      );
+      setStatus(
+        `Extracting speaker embeddings: ${msg.current}/${msg.total}...`,
+      );
+      break;
+
+    case "embeddings":
+      hideProgress();
+      assignSpeakersFromEmbeddings(msg.embeddings);
+      break;
+
     case "error":
       pendingChunks = Math.max(0, pendingChunks - 1);
       setStatus(`Error: ${msg.message}`);
+      if (identificationInProgress) {
+        identificationInProgress = false;
+        pendingEmbeddingRequest = null;
+        hideProgress();
+      }
       if (appState === "loading") {
         appState = "idle";
         hideProgress();
@@ -406,8 +442,9 @@ function updateTranscriptDisplay() {
           ? `<span class="sentence__speaker">${escapeHtml(name)}:</span> `
           : "";
         const selected = selectedIndices.has(i) ? " sentence--selected" : "";
+        const inferred = s.speakerInferred ? " sentence--inferred" : "";
         return (
-          `<div class="sentence${selected}" data-sentence-id="s${i}" data-speaker="${escapeHtml(speaker)}">` +
+          `<div class="sentence${selected}${inferred}" data-sentence-id="s${i}" data-speaker="${escapeHtml(speaker)}">` +
           `<span class="sentence__time">${escapeHtml(ts)}</span> ` +
           nameHtml +
           `<span class="sentence__text">${escapeHtml(s.text)}</span>` +
@@ -486,8 +523,9 @@ function assignSpeaker(speakerId) {
     if (idx >= transcriptSentences.length) continue;
     const s = transcriptSentences[idx];
     s.speakerId = speakerId;
+    s.speakerInferred = false;
     // Persist in the merger's label store
-    merger.setSpeakerLabel(s.start, s.end, speakerId);
+    merger.setSpeakerLabel(s.start, s.end, speakerId, false);
     // Update DOM element in place
     const el = transcriptEl.querySelector(`[data-sentence-id="s${idx}"]`);
     if (el) {
@@ -578,10 +616,13 @@ function updateControls() {
   }
 
   const hasContent = transcriptSentences.length > 0;
+  const hasAudio = !!(audioBufferSource || micAudioChunks.length > 0);
   copyBtn.disabled = !hasContent;
   downloadBtn.disabled = !hasContent;
   saveBtn.disabled = !hasContent;
   clearBtn.disabled = !hasContent;
+  identifyBtn.disabled =
+    !hasContent || !hasAudio || identificationInProgress;
 
   const canInteract = isReady || appState === "transcribing";
   dropzone.style.pointerEvents = canInteract ? "auto" : "none";
@@ -597,6 +638,161 @@ function updateModeToggle() {
 function updateThemeBtn() {
   themeBtn.textContent = themeIcon(theme);
   themeBtn.title = `Theme: ${theme}`;
+}
+
+// ── Speaker identification ────────────────────────────
+
+function cosineSimilarity(a, b) {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom > 0 ? dot / denom : 0;
+}
+
+function aggregateScores(scores, method) {
+  if (scores.length === 0) return 0;
+  if (scores.length === 1) return scores[0];
+
+  switch (method) {
+    case "max":
+      return Math.max(...scores);
+    case "median": {
+      const sorted = [...scores].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2
+        ? sorted[mid]
+        : (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+    case "mean":
+    default:
+      return scores.reduce((sum, s) => sum + s, 0) / scores.length;
+  }
+}
+
+function identifySpeakers() {
+  if (identificationInProgress) return;
+
+  // Collect all sentences with their audio slices
+  const items = [];
+  for (let i = 0; i < transcriptSentences.length; i++) {
+    const s = transcriptSentences[i];
+    const audio = getAudioSlice(s.start, s.end);
+    if (!audio || audio.length === 0) continue;
+    items.push({
+      index: i,
+      audio,
+      speakerId: s.speakerId,
+      inferred: !!s.speakerInferred,
+    });
+  }
+
+  if (items.length === 0) {
+    setStatus("No audio available for speaker identification.");
+    return;
+  }
+
+  // Check we have at least one manually labeled sentence
+  const hasManualLabels = items.some(
+    (it) => it.speakerId && it.speakerId !== "0" && !it.inferred,
+  );
+  if (!hasManualLabels) {
+    setStatus(
+      "Please manually label at least one sentence per speaker before identifying.",
+    );
+    return;
+  }
+
+  identificationInProgress = true;
+  pendingEmbeddingRequest = items;
+  updateControls();
+
+  setStatus("Loading speaker model...");
+  worker.postMessage({
+    type: "load-speaker-model",
+    model: settings.speakerModel,
+    device: settings.device,
+    quantization: settings.speakerQuantization,
+  });
+}
+
+function assignSpeakersFromEmbeddings(embeddings) {
+  if (!pendingEmbeddingRequest) return;
+
+  const items = pendingEmbeddingRequest;
+  pendingEmbeddingRequest = null;
+
+  // Attach embeddings to items
+  for (let i = 0; i < items.length; i++) {
+    items[i].embedding = embeddings[i];
+  }
+
+  // Separate reference (manually labeled, non-inferred) from unlabeled
+  const references = items.filter(
+    (it) => it.speakerId && it.speakerId !== "0" && !it.inferred,
+  );
+  const unlabeled = items.filter(
+    (it) => !it.speakerId || it.speakerId === "0" || it.inferred,
+  );
+
+  if (references.length === 0) {
+    identificationInProgress = false;
+    updateControls();
+    setStatus("No manually labeled sentences to use as reference.");
+    return;
+  }
+
+  // Group reference embeddings by speaker
+  const speakerRefs = {};
+  for (const ref of references) {
+    if (!speakerRefs[ref.speakerId]) speakerRefs[ref.speakerId] = [];
+    speakerRefs[ref.speakerId].push(ref.embedding);
+  }
+
+  // For each unlabeled sentence, compute similarity to each speaker
+  let assignedCount = 0;
+  for (const item of unlabeled) {
+    let bestSpeaker = null;
+    let bestScore = -Infinity;
+
+    for (const [speakerId, refEmbeddings] of Object.entries(speakerRefs)) {
+      const scores = refEmbeddings.map((ref) =>
+        cosineSimilarity(item.embedding, ref),
+      );
+      const aggregated = aggregateScores(scores, settings.speakerAggregation);
+
+      if (aggregated > bestScore) {
+        bestScore = aggregated;
+        bestSpeaker = speakerId;
+      }
+    }
+
+    const s = transcriptSentences[item.index];
+    if (bestScore >= settings.speakerThreshold && bestSpeaker) {
+      s.speakerId = bestSpeaker;
+      s.speakerInferred = true;
+      merger.setSpeakerLabel(s.start, s.end, bestSpeaker, true);
+      assignedCount++;
+    } else {
+      s.speakerId = "0";
+      s.speakerInferred = true;
+      merger.setSpeakerLabel(s.start, s.end, "0", true);
+    }
+  }
+
+  identificationInProgress = false;
+  selectedIndices.clear();
+  lastClickedIndex = null;
+  updateTranscriptDisplay();
+  updateControls();
+  setStatus(
+    `Speaker identification complete. Assigned ${assignedCount} of ${unlabeled.length} sentence(s).`,
+  );
 }
 
 // ── Event listeners ───────────────────────────────────
@@ -693,6 +889,9 @@ clearBtn.addEventListener("click", () => {
   updateTranscriptDisplay();
   updateControls();
 });
+
+// Identify speakers
+identifyBtn.addEventListener("click", identifySpeakers);
 
 // Library modal
 libraryBtn.addEventListener("click", () => {

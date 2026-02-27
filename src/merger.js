@@ -77,6 +77,7 @@ export function aggregateIntoSentences(chunks) {
         start: chunks[0].start,
         end: chunks[chunks.length - 1].end,
         speakerId: null,
+      speakerInferred: false,
       },
     ];
   }
@@ -101,6 +102,7 @@ export function aggregateIntoSentences(chunks) {
       start: chunks[startChunkIdx].start,
       end: chunks[endChunkIdx].end,
       speakerId: null,
+      speakerInferred: false,
     });
   }
 
@@ -110,6 +112,7 @@ export function aggregateIntoSentences(chunks) {
       start: chunks[0].start,
       end: chunks[chunks.length - 1].end,
       speakerId: null,
+      speakerInferred: false,
     });
   }
 
@@ -145,7 +148,7 @@ export class SentenceMerger {
    * @param {number} end    – sentence end time (seconds)
    * @param {string|null} speakerId – speaker ID ("1"-"6"), "0" for unclassified, or null to remove
    */
-  setSpeakerLabel(start, end, speakerId) {
+  setSpeakerLabel(start, end, speakerId, inferred = false) {
     // Remove any existing label that substantially overlaps this range
     this._speakerLabels = this._speakerLabels.filter((l) => {
       const overlapStart = Math.max(l.start, start);
@@ -156,7 +159,7 @@ export class SentenceMerger {
       return lDuration > 0 && overlap / lDuration < 0.5;
     });
     if (speakerId != null) {
-      this._speakerLabels.push({ start, end, speakerId });
+      this._speakerLabels.push({ start, end, speakerId, inferred });
     }
   }
 
@@ -193,6 +196,7 @@ export class SentenceMerger {
       const match = this._findBestLabel(s.start, s.end);
       if (match) {
         s.speakerId = match.speakerId;
+        s.speakerInferred = !!match.inferred;
       }
     }
     return sentences;
