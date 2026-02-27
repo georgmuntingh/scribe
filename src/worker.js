@@ -11,6 +11,7 @@ let currentModelKey = null;
 let speakerProcessor = null;
 let speakerModel = null;
 let currentSpeakerModelKey = null;
+let speakerModelConfig = null; // { model, device, quantization }
 
 /**
  * Build the HF model id from user settings.
@@ -216,8 +217,58 @@ async function loadSpeakerModel({ model, device, quantization }) {
     progress_callback: speakerProgressCallback,
   });
 
+  speakerModelConfig = { model, device, quantization };
   currentSpeakerModelKey = key;
   self.postMessage({ type: "speaker-model-ready" });
+}
+
+/**
+ * Detect WebGPU shader / compute-pipeline errors that indicate the GPU
+ * backend cannot handle a particular kernel (common on Android Chrome).
+ */
+function isWebGPUError(err) {
+  const msg = (err.message || String(err)).toLowerCase();
+  return (
+    msg.includes("webgpu") ||
+    msg.includes("shadermodule") ||
+    msg.includes("compute pipeline")
+  );
+}
+
+/**
+ * Reload the speaker model using the WASM (CPU) backend.
+ * Called as a fallback when WebGPU fails mid-extraction.
+ * The processor is device-independent so we keep it as-is.
+ */
+async function reloadSpeakerModelAsWasm() {
+  if (!speakerModelConfig) throw new Error("No speaker model config");
+
+  const { model, quantization } = speakerModelConfig;
+
+  if (speakerModel) {
+    try {
+      await speakerModel.dispose();
+    } catch {
+      // ignore dispose errors
+    }
+    speakerModel = null;
+    currentSpeakerModelKey = null;
+  }
+
+  self.postMessage({
+    type: "loading",
+    progress: 0,
+    status: "WebGPU error \u2014 reloading speaker model on CPU...",
+  });
+
+  speakerModel = await AutoModel.from_pretrained(model, {
+    device: "wasm",
+    dtype: quantization,
+    progress_callback: speakerProgressCallback,
+  });
+
+  speakerModelConfig.device = "wasm";
+  currentSpeakerModelKey = `${model}|wasm|${quantization}`;
 }
 
 /**
@@ -260,6 +311,8 @@ async function extractEmbeddings({ audioBuffers }) {
   }
 
   const embeddings = [];
+  let didFallback = false;
+
   for (let i = 0; i < audioBuffers.length; i++) {
     self.postMessage({
       type: "embedding-progress",
@@ -267,8 +320,25 @@ async function extractEmbeddings({ audioBuffers }) {
       total: audioBuffers.length,
     });
 
-    const inputs = await speakerProcessor(audioBuffers[i]);
-    const output = await speakerModel(inputs);
+    let output;
+    try {
+      const inputs = await speakerProcessor(audioBuffers[i]);
+      output = await speakerModel(inputs);
+    } catch (err) {
+      // If WebGPU failed and we haven't already fallen back, reload on CPU
+      if (
+        !didFallback &&
+        speakerModelConfig &&
+        speakerModelConfig.device !== "wasm" &&
+        isWebGPUError(err)
+      ) {
+        didFallback = true;
+        await reloadSpeakerModelAsWasm();
+        i--; // retry this sentence on WASM
+        continue;
+      }
+      throw err;
+    }
 
     let embedding;
     if (output.embeddings) {
