@@ -123,7 +123,7 @@ export const DEFAULT_SETTINGS = {
   chunkInterval: 10,
   overlapDuration: 3,
   recordingMode: "realtime",
-  speakerModel: "onnx-community/wavlm-base-plus-sv",
+  speakerModel: "Xenova/wavlm-base-plus-sv",
   speakerQuantization: "fp32",
   speakerThreshold: 0.86,
   speakerAggregation: "mean",
