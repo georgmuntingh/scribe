@@ -235,8 +235,9 @@ worker.addEventListener("message", (e) => {
 });
 
 function loadModel() {
+  const noEnglishOnly = ["medium", "large-v3-turbo"];
   const variantForModel =
-    settings.variant === "en" && settings.model === "medium"
+    settings.variant === "en" && noEnglishOnly.includes(settings.model)
       ? "multilingual"
       : settings.variant;
   worker.postMessage({

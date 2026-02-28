@@ -19,7 +19,8 @@ let speakerModelConfig = null; // { model, device, quantization }
  */
 function modelId(size, variant) {
   const base = `onnx-community/whisper-${size}`;
-  return variant === "en" && size !== "medium" ? `${base}.en` : base;
+  const hasEnglishOnly = ["tiny", "base", "small"].includes(size);
+  return variant === "en" && hasEnglishOnly ? `${base}.en` : base;
 }
 
 /**
@@ -33,7 +34,7 @@ function buildDtype(quantization) {
     case "fp32":
       return { encoder_model: "fp32", decoder_model_merged: "fp32" };
     case "fp16":
-      return { encoder_model: "fp16", decoder_model_merged: "fp16" };
+      return { encoder_model: "fp32", decoder_model_merged: "fp16" };
     case "q8":
       return { encoder_model: "fp32", decoder_model_merged: "q8" };
     case "q4":

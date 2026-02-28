@@ -215,6 +215,7 @@ export function buildSettingsModal(container, settings, onSave) {
       ["base", "Base (~74 MB)"],
       ["small", "Small (~244 MB)"],
       ["medium", "Medium (~769 MB)"],
+      ["large-v3-turbo", "Large v3 Turbo (~809 MB)"],
     ]),
   );
   modelRow.appendChild(
