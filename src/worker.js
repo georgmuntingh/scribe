@@ -34,22 +34,27 @@ function modelId(size, variant) {
  * The encoder is more sensitive to quantization, so we keep it at higher
  * precision while the decoder can tolerate lower precision.
  *
- * Xenova/whisper-medium uses the old "_quantized" file-name suffix for its
- * 8-bit decoder (not "_q8"), so we must pass "quantized" for that model.
+ * Xenova/whisper-medium uses the old "_quantized" file-name suffix which
+ * is not addressable by any explicit dtype value in transformers.js v4.
+ * We use "auto" for that model so the library scans what is available and
+ * picks the quantized decoder automatically.
  */
 function buildDtype(quantization, model) {
-  const decoderQ8 = model === "medium" ? "quantized" : "q8";
+  if (model === "medium") {
+    // "auto" lets transformers.js discover decoder_model_merged_quantized.onnx
+    return quantization === "fp32" ? "fp32" : "auto";
+  }
   switch (quantization) {
     case "fp32":
       return { encoder_model: "fp32", decoder_model_merged: "fp32" };
     case "fp16":
       return { encoder_model: "fp32", decoder_model_merged: "fp16" };
     case "q8":
-      return { encoder_model: "fp32", decoder_model_merged: decoderQ8 };
+      return { encoder_model: "fp32", decoder_model_merged: "q8" };
     case "q4":
       return { encoder_model: "fp32", decoder_model_merged: "q4" };
     default:
-      return { encoder_model: "fp32", decoder_model_merged: decoderQ8 };
+      return { encoder_model: "fp32", decoder_model_merged: "q8" };
   }
 }
 
@@ -59,19 +64,12 @@ function buildDtype(quantization, model) {
  * to the nearest supported option.
  */
 function effectiveQuantization(model, quantization) {
-  if (model === 'large-v3-turbo') {
+  if (model === "large-v3-turbo") {
     // onnx-community/whisper-large-v3-turbo only ships decoder_model_merged.onnx
-    // (fp32) and decoder_model_merged_fp16.onnx — there is no _q4 or _quantized
+    // (fp32) and decoder_model_merged_fp16.onnx — there is no _q4 or _q8
     // variant, so clamp anything heavier than fp16 down to fp16.
-    if (quantization === 'q4' || quantization === 'q8' || quantization === 'q4f16') {
-      return 'fp16';
-    }
-  }
-  if (model === 'medium') {
-    // Xenova/whisper-medium only ships decoder_model_merged.onnx (fp32) and
-    // decoder_model_merged_quantized.onnx (q8) — clamp fp16 and q4 to q8.
-    if (quantization === 'fp16' || quantization === 'q4' || quantization === 'q4f16') {
-      return 'q8';
+    if (quantization === "q4" || quantization === "q8" || quantization === "q4f16") {
+      return "fp16";
     }
   }
   return quantization;
