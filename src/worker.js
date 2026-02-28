@@ -29,23 +29,27 @@ function modelId(size, variant) {
 }
 
 /**
- * Map the user-friendly quantization label to the dtype config
+ * Map the user-friendly quantization label to the dtype config.
  * Whisper is an encoder-decoder model so we can set per-module dtypes.
  * The encoder is more sensitive to quantization, so we keep it at higher
  * precision while the decoder can tolerate lower precision.
+ *
+ * Xenova/whisper-medium uses the old "_quantized" file-name suffix for its
+ * 8-bit decoder (not "_q8"), so we must pass "quantized" for that model.
  */
-function buildDtype(quantization) {
+function buildDtype(quantization, model) {
+  const decoderQ8 = model === "medium" ? "quantized" : "q8";
   switch (quantization) {
     case "fp32":
       return { encoder_model: "fp32", decoder_model_merged: "fp32" };
     case "fp16":
       return { encoder_model: "fp32", decoder_model_merged: "fp16" };
     case "q8":
-      return { encoder_model: "fp32", decoder_model_merged: "q8" };
+      return { encoder_model: "fp32", decoder_model_merged: decoderQ8 };
     case "q4":
       return { encoder_model: "fp32", decoder_model_merged: "q4" };
     default:
-      return { encoder_model: "fp32", decoder_model_merged: "q8" };
+      return { encoder_model: "fp32", decoder_model_merged: decoderQ8 };
   }
 }
 
@@ -102,7 +106,7 @@ async function loadModel({ model, variant, device, quantization }) {
 
   transcriber = await pipeline("automatic-speech-recognition", id, {
     device,
-    dtype: buildDtype(quantization),
+    dtype: buildDtype(quantization, model),
     progress_callback: (progress) => {
       if (progress.status === "progress") {
         self.postMessage({
