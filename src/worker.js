@@ -16,8 +16,13 @@ let speakerModelConfig = null; // { model, device, quantization }
 /**
  * Build the HF model id from user settings.
  * English-only models use the ".en" suffix (only available for tiny/base/small).
+ * onnx-community/whisper-medium does not exist on HF Hub; use Xenova/whisper-medium
+ * which ships ONNX files with a transformers.js-compatible tokenizer.
  */
 function modelId(size, variant) {
+  if (size === "medium") {
+    return "Xenova/whisper-medium";
+  }
   const base = `onnx-community/whisper-${size}`;
   const hasEnglishOnly = ["tiny", "base", "small"].includes(size);
   return variant === "en" && hasEnglishOnly ? `${base}.en` : base;
@@ -45,10 +50,35 @@ function buildDtype(quantization) {
 }
 
 /**
+ * Some models only have a limited set of decoder quantization formats.
+ * Returns the effective quantization for the given model, falling back
+ * to the nearest supported option.
+ */
+function effectiveQuantization(model, quantization) {
+  if (model === 'large-v3-turbo') {
+    // onnx-community/whisper-large-v3-turbo only ships decoder_model_merged.onnx
+    // (fp32) and decoder_model_merged_fp16.onnx — there is no _q4 or _quantized
+    // variant, so clamp anything heavier than fp16 down to fp16.
+    if (quantization === 'q4' || quantization === 'q8' || quantization === 'q4f16') {
+      return 'fp16';
+    }
+  }
+  if (model === 'medium') {
+    // Xenova/whisper-medium only ships decoder_model_merged.onnx (fp32) and
+    // decoder_model_merged_quantized.onnx (q8) — clamp fp16 and q4 to q8.
+    if (quantization === 'fp16' || quantization === 'q4' || quantization === 'q4f16') {
+      return 'q8';
+    }
+  }
+  return quantization;
+}
+
+/**
  * Load (or re-load) the Whisper pipeline.
  */
 async function loadModel({ model, variant, device, quantization }) {
   const id = modelId(model, variant);
+  quantization = effectiveQuantization(model, quantization);
   const key = `${id}|${device}|${quantization}`;
 
   // Skip if already loaded with the same config
