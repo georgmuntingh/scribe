@@ -11,6 +11,7 @@ let currentModelKey = null;
 let speakerProcessor = null;
 let speakerModel = null;
 let currentSpeakerModelKey = null;
+let speakerModelConfig = null; // { model, device, quantization }
 
 /**
  * Build the HF model id from user settings.
@@ -216,8 +217,58 @@ async function loadSpeakerModel({ model, device, quantization }) {
     progress_callback: speakerProgressCallback,
   });
 
+  speakerModelConfig = { model, device, quantization };
   currentSpeakerModelKey = key;
   self.postMessage({ type: "speaker-model-ready" });
+}
+
+/**
+ * Detect WebGPU shader / compute-pipeline errors that indicate the GPU
+ * backend cannot handle a particular kernel (common on Android Chrome).
+ */
+function isWebGPUError(err) {
+  const msg = (err.message || String(err)).toLowerCase();
+  return (
+    msg.includes("webgpu") ||
+    msg.includes("shadermodule") ||
+    msg.includes("compute pipeline")
+  );
+}
+
+/**
+ * Reload the speaker model using the WASM (CPU) backend.
+ * Called as a fallback when WebGPU fails mid-extraction.
+ * The processor is device-independent so we keep it as-is.
+ */
+async function reloadSpeakerModelAsWasm() {
+  if (!speakerModelConfig) throw new Error("No speaker model config");
+
+  const { model, quantization } = speakerModelConfig;
+
+  if (speakerModel) {
+    try {
+      await speakerModel.dispose();
+    } catch {
+      // ignore dispose errors
+    }
+    speakerModel = null;
+    currentSpeakerModelKey = null;
+  }
+
+  self.postMessage({
+    type: "loading",
+    progress: 0,
+    status: "WebGPU error \u2014 reloading speaker model on CPU...",
+  });
+
+  speakerModel = await AutoModel.from_pretrained(model, {
+    device: "wasm",
+    dtype: quantization,
+    progress_callback: speakerProgressCallback,
+  });
+
+  speakerModelConfig.device = "wasm";
+  currentSpeakerModelKey = `${model}|wasm|${quantization}`;
 }
 
 /**
@@ -243,14 +294,78 @@ function meanPoolAndNormalize(data, seqLen, hiddenDim) {
   return Array.from(embedding);
 }
 
+const SAMPLE_RATE = 16000;
+
+/**
+ * Run the speaker model on a single audio buffer and return the
+ * L2-normalised embedding as a plain Array.
+ */
+async function extractSingleEmbedding(audioBuffer) {
+  const inputs = await speakerProcessor(audioBuffer);
+  const output = await speakerModel(inputs);
+
+  if (output.embeddings) {
+    // XVector model — speaker embeddings already computed
+    const raw = Array.from(output.embeddings.data);
+    let norm = 0;
+    for (let d = 0; d < raw.length; d++) norm += raw[d] * raw[d];
+    norm = Math.sqrt(norm);
+    if (norm > 0) for (let d = 0; d < raw.length; d++) raw[d] /= norm;
+    return raw;
+  } else if (output.last_hidden_state) {
+    // Base model — mean-pool hidden states
+    const hs = output.last_hidden_state;
+    const [, seqLen, hiddenDim] = hs.dims;
+    return meanPoolAndNormalize(hs.data, seqLen, hiddenDim);
+  } else {
+    throw new Error("Unexpected model output format");
+  }
+}
+
+/**
+ * Split an audio buffer into chunks of at most maxSamples.
+ * Returns an array of Float32Array slices (always at least one).
+ */
+function chunkAudioBuffer(audioBuffer, maxSamples) {
+  if (audioBuffer.length <= maxSamples) return [audioBuffer];
+  const chunks = [];
+  for (let offset = 0; offset < audioBuffer.length; offset += maxSamples) {
+    chunks.push(audioBuffer.subarray(offset, offset + maxSamples));
+  }
+  return chunks;
+}
+
+/**
+ * Average an array of embeddings and L2-normalise the result.
+ */
+function averageEmbeddings(embeddingList) {
+  if (embeddingList.length === 1) return embeddingList[0];
+  const dim = embeddingList[0].length;
+  const avg = new Float32Array(dim);
+  for (const emb of embeddingList) {
+    for (let d = 0; d < dim; d++) avg[d] += emb[d];
+  }
+  for (let d = 0; d < dim; d++) avg[d] /= embeddingList.length;
+  // L2-normalise
+  let norm = 0;
+  for (let d = 0; d < dim; d++) norm += avg[d] * avg[d];
+  norm = Math.sqrt(norm);
+  if (norm > 0) for (let d = 0; d < dim; d++) avg[d] /= norm;
+  return Array.from(avg);
+}
+
 /**
  * Extract speaker embeddings from an array of audio buffers.
+ *
+ * Long audio buffers are split into chunks of `maxChunkSeconds` before
+ * inference, and the per-chunk embeddings are averaged. This keeps GPU
+ * memory usage bounded and avoids WebGPU shader failures on some devices.
  *
  * If the model exposes an `embeddings` output (XVector architecture) those
  * are used directly; otherwise we fall back to mean-pooling the last hidden
  * state. All embeddings are L2-normalised before being returned.
  */
-async function extractEmbeddings({ audioBuffers }) {
+async function extractEmbeddings({ audioBuffers, maxChunkSeconds }) {
   if (!speakerModel || !speakerProcessor) {
     self.postMessage({
       type: "error",
@@ -259,7 +374,11 @@ async function extractEmbeddings({ audioBuffers }) {
     return;
   }
 
+  const maxSamples =
+    maxChunkSeconds > 0 ? maxChunkSeconds * SAMPLE_RATE : Infinity;
   const embeddings = [];
+  let didFallback = false;
+
   for (let i = 0; i < audioBuffers.length; i++) {
     self.postMessage({
       type: "embedding-progress",
@@ -267,29 +386,32 @@ async function extractEmbeddings({ audioBuffers }) {
       total: audioBuffers.length,
     });
 
-    const inputs = await speakerProcessor(audioBuffers[i]);
-    const output = await speakerModel(inputs);
+    const chunks = chunkAudioBuffer(audioBuffers[i], maxSamples);
+    const chunkEmbeddings = [];
 
-    let embedding;
-    if (output.embeddings) {
-      // XVector model — speaker embeddings already computed
-      const raw = Array.from(output.embeddings.data);
-      // L2-normalise
-      let norm = 0;
-      for (let d = 0; d < raw.length; d++) norm += raw[d] * raw[d];
-      norm = Math.sqrt(norm);
-      if (norm > 0) for (let d = 0; d < raw.length; d++) raw[d] /= norm;
-      embedding = raw;
-    } else if (output.last_hidden_state) {
-      // Base model — mean-pool hidden states
-      const hs = output.last_hidden_state;
-      const [, seqLen, hiddenDim] = hs.dims;
-      embedding = meanPoolAndNormalize(hs.data, seqLen, hiddenDim);
-    } else {
-      throw new Error("Unexpected model output format");
+    for (const chunk of chunks) {
+      let emb;
+      try {
+        emb = await extractSingleEmbedding(chunk);
+      } catch (err) {
+        // If WebGPU failed and we haven't already fallen back, reload on CPU
+        if (
+          !didFallback &&
+          speakerModelConfig &&
+          speakerModelConfig.device !== "wasm" &&
+          isWebGPUError(err)
+        ) {
+          didFallback = true;
+          await reloadSpeakerModelAsWasm();
+          emb = await extractSingleEmbedding(chunk); // retry on WASM
+        } else {
+          throw err;
+        }
+      }
+      chunkEmbeddings.push(emb);
     }
 
-    embeddings.push(embedding);
+    embeddings.push(averageEmbeddings(chunkEmbeddings));
   }
 
   self.postMessage({ type: "embeddings", embeddings });

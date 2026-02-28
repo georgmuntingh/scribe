@@ -127,6 +127,7 @@ export const DEFAULT_SETTINGS = {
   speakerQuantization: "fp32",
   speakerThreshold: 0.86,
   speakerAggregation: "mean",
+  speakerMaxChunkSeconds: 10,
 };
 
 // ── Settings persistence ──────────────────────────────
@@ -392,10 +393,21 @@ export function buildSettingsModal(container, settings, onSave) {
     ),
   );
 
+  srSection.appendChild(
+    rangeField(
+      "Max chunk length (seconds)",
+      "s-speakerMaxChunkSeconds",
+      settings.speakerMaxChunkSeconds,
+      5,
+      30,
+      1,
+    ),
+  );
+
   const srHint = document.createElement("div");
   srHint.className = "field__hint";
   srHint.textContent =
-    "Speaker identification compares sentence embeddings to manually labeled references. Aggregation controls how multiple reference scores per speaker are combined.";
+    "Speaker identification compares sentence embeddings to manually labeled references. Aggregation controls how multiple reference scores per speaker are combined. Long sentences are split into chunks for embedding extraction.";
   srSection.appendChild(srHint);
 
   modal.appendChild(srSection);
@@ -450,6 +462,7 @@ export function buildSettingsModal(container, settings, onSave) {
       speakerQuantization: val("s-speakerQuantization"),
       speakerThreshold: floatVal("s-speakerThreshold"),
       speakerAggregation: val("s-speakerAggregation"),
+      speakerMaxChunkSeconds: intVal("s-speakerMaxChunkSeconds"),
     };
     saveSettings(updated);
     container.classList.remove("modal-backdrop--open");
