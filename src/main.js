@@ -143,9 +143,12 @@ worker.addEventListener("message", (e) => {
 
   switch (msg.type) {
     case "loading":
-      if (!identificationInProgress) {
-        appState = "loading";
-      }
+      // Guard against stale in-flight download events that arrive after
+      // the current load attempt has already failed (appState = "idle")
+      // or completed (appState = "ready"). Without this, a large
+      // encoder download that continues past a decoder 404 error would
+      // re-set appState to "loading" and leave the progress bar stuck.
+      if (!identificationInProgress && appState !== "loading") break;
       showProgress(msg.progress, msg.status);
       updateControls();
       break;
@@ -235,8 +238,14 @@ worker.addEventListener("message", (e) => {
 });
 
 function loadModel() {
+  // Set appState eagerly so stale "loading" events from a previous
+  // in-flight download are not treated as belonging to this request.
+  appState = "loading";
+  updateControls();
+
+  const noEnglishOnly = ["medium", "large-v3-turbo"];
   const variantForModel =
-    settings.variant === "en" && settings.model === "medium"
+    settings.variant === "en" && noEnglishOnly.includes(settings.model)
       ? "multilingual"
       : settings.variant;
   worker.postMessage({
