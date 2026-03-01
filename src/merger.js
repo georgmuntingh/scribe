@@ -219,8 +219,27 @@ export class SentenceMerger {
 
     if (absChunks.length === 0) return this.sentences();
 
-    this._chunks = this._chunks.filter((c) => c.end <= windowOffset);
-    this._chunks.push(...absChunks);
+    // Keep old chunks that start before the new window.  This preserves
+    // "straddling" chunks (start < windowOffset, end > windowOffset) whose
+    // pre-windowOffset content would otherwise be lost — the new window
+    // only has audio from windowOffset onwards and cannot fully
+    // re-transcribe them.  Chunks entirely within the overlap region
+    // (start >= windowOffset) are dropped and replaced by the new window's
+    // transcription, which benefits from more right-side context.
+    this._chunks = this._chunks.filter((c) => c.start < windowOffset);
+
+    // Determine the latest end time among straddling old chunks so we
+    // can skip new chunks that overlap with them (avoiding duplication).
+    const straddleEnd = this._chunks.reduce(
+      (max, c) => (c.end > windowOffset ? Math.max(max, c.end) : max),
+      windowOffset,
+    );
+
+    for (const c of absChunks) {
+      if (c.start >= straddleEnd) {
+        this._chunks.push(c);
+      }
+    }
     this._chunks.sort((a, b) => a.start - b.start);
 
     return this.sentences();
