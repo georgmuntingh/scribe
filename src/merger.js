@@ -82,17 +82,39 @@ export function aggregateIntoSentences(chunks) {
     ];
   }
 
+  // Build sentences by walking through the split parts and tracking
+  // our position in fullText directly, rather than using indexOf which
+  // can silently skip sentences when there are duplicate substrings.
   const sentences = [];
-  let searchFrom = 0;
+  let pos = 0;
 
   for (const sentText of sentenceTexts) {
     if (!sentText) continue;
 
-    const idx = fullText.indexOf(sentText, searchFrom);
-    if (idx === -1) continue;
+    // Advance past any leading whitespace in fullText
+    while (pos < fullText.length && fullText[pos] === " ") pos++;
+
+    // sentText must appear at pos (it was split from fullText sequentially)
+    const idx = fullText.indexOf(sentText, pos);
+    if (idx === -1) {
+      // Fallback: use current position and advance by sentText length.
+      // This ensures the sentence is never silently dropped.
+      const startChunkIdx = charToChunk[pos] ?? 0;
+      const fallbackEnd = Math.min(pos + sentText.length - 1, charToChunk.length - 1);
+      const endChunkIdx = charToChunk[fallbackEnd] ?? chunks.length - 1;
+      sentences.push({
+        text: sentText,
+        start: chunks[startChunkIdx].start,
+        end: chunks[endChunkIdx].end,
+        speakerId: null,
+        speakerInferred: false,
+      });
+      pos += sentText.length;
+      continue;
+    }
 
     const endIdx = idx + sentText.length - 1;
-    searchFrom = idx + sentText.length;
+    pos = idx + sentText.length;
 
     const startChunkIdx = charToChunk[idx] ?? 0;
     const endChunkIdx = charToChunk[endIdx] ?? chunks.length - 1;
@@ -134,6 +156,15 @@ export class SentenceMerger {
     this._chunks = [];
 
     /**
+     * Sentences that have been finalized and will not be re-aggregated.
+     * Once a sentence's time range is fully before the current overlap
+     * window, it is moved here so that later re-aggregation cannot
+     * alter or drop it.
+     * @type {Array<{text: string, start: number, end: number, speakerId: string|null, speakerInferred: boolean}>}
+     */
+    this._finalizedSentences = [];
+
+    /**
      * Preserved speaker labels keyed by time range.
      * @type {Array<{start: number, end: number, speakerId: string}>}
      */
@@ -160,6 +191,18 @@ export class SentenceMerger {
     });
     if (speakerId != null) {
       this._speakerLabels.push({ start, end, speakerId, inferred });
+    }
+    // Also update any finalized sentences that match this time range
+    for (const s of this._finalizedSentences) {
+      const dur = s.end - s.start;
+      if (dur <= 0) continue;
+      const oStart = Math.max(s.start, start);
+      const oEnd = Math.min(s.end, end);
+      const overlap = Math.max(0, oEnd - oStart);
+      if (overlap >= dur * 0.5) {
+        s.speakerId = speakerId;
+        s.speakerInferred = !!inferred;
+      }
     }
   }
 
@@ -189,21 +232,27 @@ export class SentenceMerger {
 
   /**
    * Build sentences from chunks and apply preserved speaker labels.
+   * Finalized sentences are prepended as-is (already have speaker labels).
+   * Only active (non-finalized) chunks are re-aggregated.
    */
   sentences() {
-    const sentences = aggregateIntoSentences(this._chunks);
-    for (const s of sentences) {
+    const active = aggregateIntoSentences(this._chunks);
+    for (const s of active) {
       const match = this._findBestLabel(s.start, s.end);
       if (match) {
         s.speakerId = match.speakerId;
         s.speakerInferred = !!match.inferred;
       }
     }
-    return sentences;
+    return [...this._finalizedSentences, ...active];
   }
 
   /**
    * Add chunks from a real-time audio window.
+   *
+   * Before discarding overlap-region chunks, sentences that end strictly
+   * before the new window's start are finalized so they can never be
+   * lost by subsequent re-aggregation.
    */
   addWindow(whisperChunks, windowOffset) {
     if (!whisperChunks || whisperChunks.length === 0) return this.sentences();
@@ -219,9 +268,74 @@ export class SentenceMerger {
 
     if (absChunks.length === 0) return this.sentences();
 
-    this._chunks = this._chunks.filter((c) => c.end <= windowOffset);
+    // ── Finalize sentences that are entirely before the new window ──
+    // Aggregate current active chunks into sentences, and move any
+    // sentence whose end time is strictly before windowOffset into
+    // _finalizedSentences.  These sentences will never be re-aggregated.
+    const currentSentences = aggregateIntoSentences(this._chunks);
+    for (const s of currentSentences) {
+      if (s.end < windowOffset) {
+        // Apply speaker label before finalizing
+        const match = this._findBestLabel(s.start, s.end);
+        if (match) {
+          s.speakerId = match.speakerId;
+          s.speakerInferred = !!match.inferred;
+        }
+        this._finalizedSentences.push(s);
+      }
+    }
+
+    // ── Keep only chunks that overlap or follow the new window ──
+    // Use strict < so chunks ending exactly at windowOffset are kept
+    // rather than silently discarded (off-by-one fix).
+    this._chunks = this._chunks.filter((c) => c.end >= windowOffset);
+
+    // ── Remove old chunks that are now fully covered by new window ──
+    // Among the kept chunks, discard those from previous windows whose
+    // time range is entirely within the new window's coverage.  The new
+    // window's transcription of this region is more accurate because it
+    // has more surrounding context.
+    if (absChunks.length > 0) {
+      const newStart = absChunks[0].start;
+      const newEnd = absChunks[absChunks.length - 1].end;
+      this._chunks = this._chunks.filter(
+        (c) => !(c.start >= newStart && c.end <= newEnd),
+      );
+    }
+
     this._chunks.push(...absChunks);
     this._chunks.sort((a, b) => a.start - b.start);
+
+    return this.sentences();
+  }
+
+  /**
+   * Add chunks from a real-time audio window WITHOUT merging.
+   * Each window's sentences are appended as-is, avoiding overlap
+   * de-duplication (and the sentence loss it can cause).
+   */
+  addWindowNoMerge(whisperChunks, windowOffset) {
+    if (!whisperChunks || whisperChunks.length === 0) return this.sentences();
+
+    const absChunks = [];
+    for (const c of whisperChunks) {
+      const text = (c.text || "").replace(/\[BLANK_AUDIO\]/gi, "").trim();
+      if (!text) continue;
+      const start = windowOffset + (c.timestamp?.[0] ?? 0);
+      const end = windowOffset + (c.timestamp?.[1] ?? c.timestamp?.[0] ?? 0);
+      absChunks.push({ text, start, end });
+    }
+
+    if (absChunks.length === 0) return this.sentences();
+
+    // Aggregate only the NEW window's chunks into sentences and append them
+    // to the existing chunk list without touching previous chunks.
+    const newSentences = aggregateIntoSentences(absChunks);
+    for (const s of newSentences) {
+      // Store each sentence as a single consolidated chunk so previous
+      // sentences are never re-aggregated or discarded.
+      this._chunks.push({ text: s.text, start: s.start, end: s.end });
+    }
 
     return this.sentences();
   }
@@ -273,6 +387,7 @@ export class SentenceMerger {
    */
   reset() {
     this._chunks = [];
+    this._finalizedSentences = [];
     this._speakerLabels = [];
   }
 }
