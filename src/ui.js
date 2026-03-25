@@ -122,6 +122,7 @@ export const DEFAULT_SETTINGS = {
   initialPrompt: "",
   chunkInterval: 10,
   overlapDuration: 3,
+  mergeMode: "merge",
   recordingMode: "realtime",
   speakerModel: "Xenova/wavlm-base-plus-sv",
   speakerQuantization: "fp32",
@@ -335,6 +336,19 @@ export function buildSettingsModal(container, settings, onSave) {
     "Overlap between consecutive audio windows. Higher values improve accuracy at chunk boundaries but increase processing.";
   recSection.appendChild(overlapHint);
 
+  recSection.appendChild(
+    selectField("Overlap handling", "s-mergeMode", settings.mergeMode, [
+      ["merge", "Merge overlapping windows"],
+      ["no-merge", "No merging (append each window)"],
+    ]),
+  );
+
+  const mergeHint = document.createElement("div");
+  mergeHint.className = "field__hint";
+  mergeHint.textContent =
+    "\"Merge\" replaces overlap regions with the latest transcription. \"No merging\" appends each window as separate sentences, avoiding sentence loss.";
+  recSection.appendChild(mergeHint);
+
   modal.appendChild(recSection);
 
   // ── Speaker Recognition section ────
@@ -458,6 +472,7 @@ export function buildSettingsModal(container, settings, onSave) {
       initialPrompt: val("s-initialPrompt"),
       chunkInterval: intVal("s-chunkInterval"),
       overlapDuration: intVal("s-overlapDuration"),
+      mergeMode: val("s-mergeMode"),
       recordingMode: settings.recordingMode, // preserved from app state
       speakerModel: val("s-speakerModel"),
       speakerQuantization: val("s-speakerQuantization"),

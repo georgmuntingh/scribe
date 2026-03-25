@@ -166,10 +166,10 @@ worker.addEventListener("message", (e) => {
         const chunks = msg.chunks || [];
         if (chunks.length > 0) {
           if (msg.usesMerger) {
-            transcriptSentences = merger.addWindow(
-              chunks,
-              msg.windowOffset ?? 0,
-            );
+            const noMerge = settings.mergeMode === "no-merge";
+            transcriptSentences = noMerge
+              ? merger.addWindowNoMerge(chunks, msg.windowOffset ?? 0)
+              : merger.addWindow(chunks, msg.windowOffset ?? 0);
           } else {
             if (transcriptSentences.length > 0) {
               transcriptSentences = merger.appendChunks(chunks);

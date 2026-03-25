@@ -227,6 +227,37 @@ export class SentenceMerger {
   }
 
   /**
+   * Add chunks from a real-time audio window WITHOUT merging.
+   * Each window's sentences are appended as-is, avoiding overlap
+   * de-duplication (and the sentence loss it can cause).
+   */
+  addWindowNoMerge(whisperChunks, windowOffset) {
+    if (!whisperChunks || whisperChunks.length === 0) return this.sentences();
+
+    const absChunks = [];
+    for (const c of whisperChunks) {
+      const text = (c.text || "").replace(/\[BLANK_AUDIO\]/gi, "").trim();
+      if (!text) continue;
+      const start = windowOffset + (c.timestamp?.[0] ?? 0);
+      const end = windowOffset + (c.timestamp?.[1] ?? c.timestamp?.[0] ?? 0);
+      absChunks.push({ text, start, end });
+    }
+
+    if (absChunks.length === 0) return this.sentences();
+
+    // Aggregate only the NEW window's chunks into sentences and append them
+    // to the existing chunk list without touching previous chunks.
+    const newSentences = aggregateIntoSentences(absChunks);
+    for (const s of newSentences) {
+      // Store each sentence as a single consolidated chunk so previous
+      // sentences are never re-aggregated or discarded.
+      this._chunks.push({ text: s.text, start: s.start, end: s.end });
+    }
+
+    return this.sentences();
+  }
+
+  /**
    * Set chunks directly (file upload or manual recording).
    */
   setChunks(whisperChunks) {
